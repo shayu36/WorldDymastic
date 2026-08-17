@@ -319,10 +319,11 @@ class LoadMultiViewImageFromMultiSweeps:
             return results
 
         world_size = get_dist_info()[1]
-        if world_size == 1 and self.test_mode:
+        has_online_sweeps = 'cam_sweeps' in results and \
+            'prev' in results['cam_sweeps']
+        if world_size == 1 and self.test_mode and has_online_sweeps:
             return self.load_online(results)
-        else:
-            return self.load_offline(results)
+        return self.load_offline(results)
 
 
 
@@ -1543,4 +1544,3 @@ class RandomTransformImage:
             rotate = 0
 
         return resize, resize_dims, crop, flip, rotate
-
