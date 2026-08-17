@@ -558,10 +558,16 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
                 pickle.dump(out_pkl, file=f)
         iou_res_list = self.occ_eval_metrics.count_iou()
         mIoU_1s, miou_res_list = self.occ_eval_metrics.count_miou()
+        dynamic_miou = self.occ_eval_metrics.count_group_miou(
+            [2, 3, 4, 5, 6, 7, 9, 10])
+        static_miou = self.occ_eval_metrics.count_group_miou(
+            [1, 8, 11, 12, 13, 14, 15, 16])
 
         res = {
             "IoU": iou_res_list,
             "mIoU": miou_res_list,
+            "dynamic_mIoU": dynamic_miou,
+            "static_mIoU": static_miou,
             "classes": len(mIoU_1s) - 1,
         }
         return res

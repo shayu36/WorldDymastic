@@ -1,54 +1,73 @@
-import torch
 import numpy as np
+import pytest
+import torch
 from mmcv import Config
+
 from mmdet3d.models import build_model
 
 
+def _sparse_semantics(batch_size, step):
+    semantics = torch.full(
+        (batch_size, 200, 200, 16), 17, dtype=torch.long)
+    start = 80 + step
+    semantics[:, start:start + 4, 96:100, 7:9] = 4
+    semantics[:, 105:109, 110:114, 7:9] = 11
+    return semantics
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='full DSQE smoke test requires CUDA')
 def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
     cfg = Config.fromfile(
-        'configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune.py')
+        'configs/sparseworld/nuscenes-temporal/'
+        'sparseworld-traj-finetune.py')
     model = build_model(
         cfg.model, train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
-    model.set_epoch(cfg.finetune_epoch)
-    model.train()
+    model.init_weights()
+    model.set_epoch(cfg.finetune_epoch + 1)
+    model.cuda().train()
 
-    batch_size = 2
-    num_cams = 6
-    h, w = 256, 704
-    img = torch.randn(batch_size, num_cams, 3, h, w)
+    batch_size = 1
+    num_images = cfg.num_frames * 6
+    height, width = 64, 96
+    img = torch.randn(
+        batch_size, num_images, 3, height, width, device='cuda')
 
+    identity = np.eye(4, dtype=np.float32)
     img_metas = [{
-        'ego2lidar': np.eye(4, dtype=np.float32),
-        'ego2global': np.eye(4, dtype=np.float32),
-        'lidar2img': np.tile(np.eye(4, dtype=np.float32)[None, :, :], (6, 1, 1)),
-    } for _ in range(batch_size)]
+        'ego2lidar': identity,
+        'ego2global': identity,
+        'lidar2img': np.tile(identity[None], (num_images, 1, 1)),
+    }]
 
     temporal_ego_states = {
-        i: torch.randn(batch_size, 1, 21) for i in range(6)}
-    temporal_trajs = torch.randn(batch_size, 6, 2)
+        index: torch.randn(batch_size, 1, 21, device='cuda')
+        for index in range(6)}
+    temporal_trajs = torch.randn(batch_size, 6, 2, device='cuda')
     temporal_ego2global = {
-        i: np.tile(np.eye(4, dtype=np.float32)[None, :, :], (batch_size, 1, 1))
-        for i in range(6)
-    }
+        index: np.tile(identity[None], (batch_size, 1, 1))
+        for index in range(6)}
     temporal2ego = {
-        i: np.tile(np.eye(4, dtype=np.float32)[None, :, :], (batch_size, 1, 1))
-        for i in range(6)
-    }
+        index: torch.eye(4, device='cuda').unsqueeze(0)
+        for index in range(6)}
     temporal_semantics = {
-        i: {
-            'voxel_semantics': torch.randint(
-                0, 18, (batch_size, 200, 200, 16)),
-            'mask_lidar': torch.ones(batch_size, 200, 200, 16, dtype=torch.bool),
+        index: {
+            'voxel_semantics': _sparse_semantics(
+                batch_size, index).cuda(),
+            'mask_lidar': torch.ones(
+                batch_size, 200, 200, 16, dtype=torch.bool,
+                device='cuda'),
             'mask_camera': torch.ones(
-                batch_size, 200, 200, 16, dtype=torch.bool),
+                batch_size, 200, 200, 16, dtype=torch.bool,
+                device='cuda'),
         }
-        for i in range(1, 3)
+        for index in range(1, 7)
     }
 
-    voxel_semantics = torch.randint(0, 18, (batch_size, 200, 200, 16))
-    mask_lidar = torch.ones(batch_size, 200, 200, 16, dtype=torch.bool)
-    mask_camera = torch.ones(batch_size, 200, 200, 16, dtype=torch.bool)
+    voxel_semantics = _sparse_semantics(batch_size, 0).cuda()
+    mask_lidar = torch.ones_like(voxel_semantics, dtype=torch.bool)
+    mask_camera = torch.ones_like(voxel_semantics, dtype=torch.bool)
 
     losses = model(
         return_loss=True,
@@ -61,27 +80,27 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
         temporal_trajs=temporal_trajs,
         temporal_ego2global=temporal_ego2global,
         temporal2ego=temporal2ego,
-        temporal_semantics=temporal_semantics
-    )
+        temporal_semantics=temporal_semantics)
 
-    assert 'loss_total' in losses
-    assert 'fu1.loss_role' in losses
-    assert 'fu1.loss_dynamic' in losses
-    assert 'fu2.loss_role' in losses
-    assert 'fu2.loss_dynamic' in losses
-    assert torch.isfinite(losses['loss_total'])
-    print('loss_total:', losses['loss_total'].item())
-    print('loss keys:', len([k for k in losses if k.startswith('fu')]))
+    assert 'loss_total' not in losses
+    for key in ('fu1.loss_role', 'fu1.loss_dynamic',
+                'fu2.loss_role', 'fu2.loss_dynamic'):
+        assert key in losses
+        assert torch.isfinite(losses[key]).all()
 
-    losses['loss_total'].backward()
-    role_grad_finite = all(
-        p.grad is not None and torch.isfinite(p.grad).all()
-        for p in model.role_router.parameters()
-    )
-    print('role_router grad finite:', role_grad_finite)
-    assert role_grad_finite
+    loss_total = sum(
+        value.mean() for key, value in losses.items() if 'loss' in key)
+    assert torch.isfinite(loss_total)
+    loss_total.backward()
+
+    role_gradients = [
+        parameter.grad for parameter in model.role_router.parameters()
+        if parameter.grad is not None
+    ]
+    assert role_gradients
+    assert all(torch.isfinite(gradient).all()
+               for gradient in role_gradients)
 
 
 if __name__ == '__main__':
     test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss()
-    print('Test passed')

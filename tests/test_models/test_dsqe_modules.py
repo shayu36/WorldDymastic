@@ -1,4 +1,7 @@
 import torch
+import torch.nn as nn
+import numpy as np
+from types import SimpleNamespace
 
 from mmdet3d.models.sparsedetectors.bbox.utils import (
     decode_points, encode_points)
@@ -9,6 +12,10 @@ from mmdet3d.models.sparsedetectors.dsqe_dual_interaction import (
 from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
 from mmdet3d.models.sparsedetectors.dsqe_joint_refine import DSQEJointRefine
 from mmdet3d.models.sparsedetectors.dsqe_role_router import DSQERoleRouter
+from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import (
+    SparseWorld4DTraj)
+from mmdet3d.datasets.occ_metrics import Metric_mIoU_Temporal
 
 
 PC_RANGE = [-10.0, -10.0, -2.0, 10.0, 10.0, 2.0]
@@ -215,3 +222,88 @@ def test_dual_interaction_and_joint_refine_are_finite():
         stream['static_from_dynamic_gate']
     output['query_feat'].sum().backward()
     assert torch.isfinite(query_feat.grad).all()
+
+
+def test_semantic_correction_is_an_explicit_scaled_residual():
+    model = SimpleNamespace(
+        num_refines=4,
+        dsqe_cfg={'semantic_residual_scale': 0.25},
+        semantic_correction_head=nn.Linear(8, 4 * 17, bias=False))
+    nn.init.constant_(model.semantic_correction_head.weight, 0.5)
+    base = torch.randn(2, 3, 4, 17)
+    feat = torch.ones(2, 3, 8, requires_grad=True)
+
+    semantics, correction = SparseWorld4DTraj._refine_semantics(
+        model, base, feat)
+    torch.testing.assert_close(semantics, base + 0.25 * correction)
+    (semantics - base).sum().backward()
+    assert feat.grad is not None
+    assert torch.isfinite(feat.grad).all()
+
+
+def test_chunked_dynamic_nearest_neighbor_matches_full_cdist(monkeypatch):
+    torch.manual_seed(7)
+    query = torch.randn(23, 3)
+    reference = torch.randn(19, 3, requires_grad=True)
+    expected = torch.cdist(query, reference.detach(), p=1).argmin(dim=1)
+
+    cdist_shapes = []
+    original_cdist = torch.cdist
+
+    def recording_cdist(left, right, *args, **kwargs):
+        cdist_shapes.append((left.shape[0], right.shape[0]))
+        return original_cdist(left, right, *args, **kwargs)
+
+    monkeypatch.setattr(torch, 'cdist', recording_cdist)
+    actual = OPUSHead._chunked_nearest_indices(
+        query, reference, chunk_size=5)
+    torch.testing.assert_close(actual, expected)
+    assert cdist_shapes
+    assert max(max(shape) for shape in cdist_shapes) <= 5
+
+    paired = reference[actual]
+    (query - paired).abs().mean().backward()
+    assert reference.grad is not None
+    assert torch.isfinite(reference.grad).all()
+
+
+def test_official_baseline_foreground_mask_is_preserved():
+    pc_range = torch.tensor(PC_RANGE)
+    model = SimpleNamespace(pc_range=pc_range)
+    model._to_batch_tensor = SparseWorld4DTraj._to_batch_tensor
+    model.trans_points = lambda points, delta, matrix: \
+        SparseWorld4DTraj.trans_points(model, points, delta, matrix)
+
+    metric_points = torch.tensor([[[
+        [-2.0, 0.0, 0.0], [2.0, 0.0, 0.0]
+    ]]])
+    points = encode_points(metric_points, pc_range)
+    trajectory = torch.tensor([[[3.0, 0.0]]])
+    kwargs = {'temporal_trajs': trajectory}
+    img_metas = [{'ego2lidar': torch.eye(4).numpy()}]
+
+    actual = SparseWorld4DTraj._baseline_foreground_mask(
+        model, points, 0, img_metas, kwargs)
+
+    offset = torch.tensor([[[-3.0, 0.0, 0.0]]])
+    official_points = SparseWorld4DTraj.trans_points(
+        model, points.flatten(1, 2), offset,
+        torch.eye(4).unsqueeze(0)).reshape_as(points)
+    expected = official_points[..., 0] >= 0
+    torch.testing.assert_close(actual, expected)
+    assert not torch.equal(
+        actual, decode_points(points, pc_range)[..., 0] >= 0)
+
+
+def test_temporal_metric_reports_dynamic_and_static_group_miou():
+    metric = Metric_mIoU_Temporal(num_classes=18)
+    perfect_hist = np.eye(18, dtype=np.float64)
+    metric.hist_0s = perfect_hist.copy()
+    metric.hist_1s = perfect_hist.copy()
+    metric.hist_2s = perfect_hist.copy()
+    metric.hist_3s = perfect_hist.copy()
+
+    dynamic = metric.count_group_miou(DYNAMIC_IDS)
+    static = metric.count_group_miou([1, 8, 11, 12, 13, 14, 15, 16])
+    assert dynamic == [100.0] * 4
+    assert static == [100.0] * 4

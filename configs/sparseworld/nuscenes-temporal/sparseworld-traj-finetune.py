@@ -145,6 +145,7 @@ model = dict(
         role_alpha=0.75,
         role_query_weight=0.5,
         dynamic_cls_weight=1.0,
+        dynamic_cdist_chunk_size=1024,
         ego_yaw_weight=1.0,
         lambda_role=0.5,
         lambda_static=0.2,
@@ -300,7 +301,10 @@ for key in ['val', 'train', 'test']:
 
 # Optimizer
 optimizer = dict(type='AdamW', lr=2e-4, weight_decay=1e-2)
-optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
+optimizer_config = dict(
+    type='GradientCumulativeOptimizerHook',
+    cumulative_iters=8,
+    grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',

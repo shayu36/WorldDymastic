@@ -341,6 +341,7 @@ class OPUSSelfAttention(BaseModule):
         self.num_query = num_query
         self.num_heads = num_heads
         self.num_fu_query = num_fu_query
+        self.register_buffer('ind_mask', None, persistent=False)
     @torch.no_grad()
     def init_weights(self):
         nn.init.zeros_(self.gen_tau.weight)

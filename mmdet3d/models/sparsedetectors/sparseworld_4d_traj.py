@@ -197,6 +197,11 @@ class SparseWorld4DTraj(OPUS):
             dropout=dropout,
             use_checkpoint=cfg.get('use_checkpoint', False))
 
+        self.semantic_correction_head = nn.Sequential(
+            nn.Linear(self.out_dim, self.out_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.out_dim, self.num_refines * 17))
+
         self.ego_cross_attn_static = OPUSCrossAttention(
             self.out_dim, num_heads, dropout, self.pc_range)
         self.ego_dynamic_proj = nn.Linear(self.out_dim, self.out_dim)
@@ -219,6 +224,8 @@ class SparseWorld4DTraj(OPUS):
             self.ego_static_proj.bias.zero_()
             self.yaw_head[-1].weight.zero_()
             self.yaw_head[-1].bias.copy_(torch.tensor([0.0, 1.0]))
+            self.semantic_correction_head[-1].weight.zero_()
+            self.semantic_correction_head[-1].bias.zero_()
 
     def init_weights(self):
         self.pts_bbox_head.init_weights()
@@ -259,6 +266,33 @@ class SparseWorld4DTraj(OPUS):
         points_proposal = decode_points(points_proposal, self.pc_range)
         points_proposal = points_proposal.mean(dim=2, keepdim=True)
         return encode_points(points_proposal + points_delta, self.pc_range)
+
+    def trans_points(self, points_proposal, points_delta, trans_matrix):
+        """Apply the official SCF trajectory mask transform."""
+        inverse = torch.linalg.inv(trans_matrix)
+        points = decode_points(points_proposal, self.pc_range)
+        points = torch.matmul(
+            points, trans_matrix[..., :3, :3].transpose(-1, -2))
+        points = points + trans_matrix[..., None, :3, 3] + points_delta
+        points = torch.matmul(
+            points, inverse[..., :3, :3].transpose(-1, -2))
+        points = points + inverse[..., None, :3, 3]
+        return encode_points(points, self.pc_range)
+
+    def _baseline_foreground_mask(self, points, interval, img_metas, kwargs):
+        """Reproduce the official DSQE-off future range mask exactly."""
+        ego_to_lidar = self._to_batch_tensor(
+            [meta['ego2lidar'] for meta in img_metas],
+            points.device, points.dtype)
+        gt_traj = kwargs['temporal_trajs'][:, interval:interval + 1, :]
+        gt_traj = gt_traj.to(device=points.device, dtype=points.dtype)
+        trajectory_offset = torch.cat([
+            -gt_traj, torch.zeros_like(gt_traj[..., :1])
+        ], dim=-1)
+        transformed = self.trans_points(
+            points.flatten(1, 2), trajectory_offset,
+            ego_to_lidar).reshape_as(points)
+        return transformed[..., 0] >= 0
 
     def loss_traj(self, pred_traj, gt_traj, ego_interval):
         return {
@@ -406,6 +440,14 @@ class SparseWorld4DTraj(OPUS):
                                    dtype=torch.bool)
             ], dim=1)
         return teacher, valid
+
+    def _refine_semantics(self, base_semantics, next_feat):
+        batch_size = next_feat.shape[0]
+        correction = self.semantic_correction_head(next_feat).reshape(
+            batch_size, -1, self.num_refines, 17)
+        semantics = base_semantics + self.dsqe_cfg[
+            'semantic_residual_scale'] * correction
+        return semantics, correction
 
     def _forward_dsqe_scf(self, outs, ego_feat, img_metas, kwargs):
         ind_stamps_all = self.pts_bbox_head.ind_stamps_all
@@ -564,8 +606,8 @@ class SparseWorld4DTraj(OPUS):
             next_points_metric = evolution_output['points_metric'] + \
                 correction_gate * correction
             next_points = encode_points(next_points_metric, self.pc_range)
-            next_semantics = self.cls_branch(next_feat).reshape(
-                batch_size, -1, self.num_refines, 17)
+            next_semantics, semantic_correction = self._refine_semantics(
+                base_semantics, next_feat)
 
             forecast_points_list.append(next_points)
             forecast_semantics_list.append(next_semantics)
@@ -592,6 +634,7 @@ class SparseWorld4DTraj(OPUS):
                 role_logits=corrected_role_logits,
                 role_pred=corrected_role,
                 role_correction=role_correction,
+                semantic_correction=semantic_correction,
                 route_role=role_output['route_role'],
                 query_role=corrected_query_role,
                 pool_weights=role_output['pool_weights'],
@@ -693,8 +736,10 @@ class SparseWorld4DTraj(OPUS):
                 current_pos, reg_offset.flatten(2, 3))
             forecast_semantics_list.append(cls_score)
             forecast_points_list.append(current_pos)
-            forecast_points_mask_list.append(
-                decode_points(current_pos, self.pc_range)[..., 0] >= 0)
+            if self.training:
+                forecast_points_mask_list.append(
+                    self._baseline_foreground_mask(
+                        current_pos, interval, img_metas, kwargs))
 
         if not self.pretrain and len(pred_trajs_list) < self.num_fu_frames:
             fused_ego_feat, _ = self.ego_cross_attn(

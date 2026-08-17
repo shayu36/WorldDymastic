@@ -596,6 +596,24 @@ class Metric_mIoU_Temporal():
         miou_res_list.append(miou_res_3s)
 
         return mIoU_1s, miou_res_list
+
+    def count_group_miou(self, class_ids):
+        """Return grouped semantic mIoU for the evaluated 0--3 s horizons."""
+        class_ids = np.asarray(class_ids, dtype=np.int64)
+        if class_ids.ndim != 1 or class_ids.size == 0:
+            raise ValueError('class_ids must be a non-empty one-dimensional list')
+        if (class_ids < 0).any() or (class_ids >= self.num_classes - 1).any():
+            raise ValueError('class_ids must contain non-empty semantic classes')
+
+        scores = []
+        for hist in (self.hist_0s, self.hist_1s,
+                     self.hist_2s, self.hist_3s):
+            per_class = self.per_class_iu(hist)[class_ids]
+            valid = per_class[np.isfinite(per_class)]
+            score = float('nan') if valid.size == 0 else \
+                round(float(valid.mean() * 100), 2)
+            scores.append(score)
+        return scores
     
     def count_iou(self):
         ind_class = -1

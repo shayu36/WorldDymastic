@@ -631,14 +631,14 @@ class OPUSHead(BaseModule):
             if gt_mask.any():
                 dynamic_gt_points = cache['gt_points_list'][batch_index][
                     gt_mask]
-                pred_role = output['role_pred'][batch_index].squeeze(-1)
+                pred_role = output['role_pred'][batch_index].reshape(-1)
                 dynamic_pred_mask = pred_role > 0.5
                 if dynamic_pred_mask.any():
                     dynamic_pred_points = refine_pts_flat[batch_index][
                         dynamic_pred_mask]
-                    pairwise_dist = torch.cdist(
-                        dynamic_gt_points, dynamic_pred_points, p=1)
-                    nearest_in_dynamic = pairwise_dist.argmin(dim=1)
+                    nearest_in_dynamic = self._chunked_nearest_indices(
+                        dynamic_gt_points, dynamic_pred_points,
+                        self.dsqe_cfg.get('dynamic_cdist_chunk_size', 1024))
                     gt_paired = dynamic_pred_points[nearest_in_dynamic]
                     gt_error = (
                         dynamic_gt_points - gt_paired).abs().mean(dim=-1)
@@ -659,6 +659,42 @@ class OPUSHead(BaseModule):
                 avg_factor=max(dynamic_scores.shape[0], 1))
         return distance_loss + self.dsqe_cfg.get(
             'dynamic_cls_weight', 1.0) * classification_loss
+
+    @staticmethod
+    def _chunked_nearest_indices(query_points, reference_points,
+                                 chunk_size=1024):
+        """Exact L1 nearest neighbors with bounded pairwise memory."""
+        if query_points.shape[0] == 0 or reference_points.shape[0] == 0:
+            return torch.empty(
+                query_points.shape[0], device=query_points.device,
+                dtype=torch.long)
+        if chunk_size <= 0:
+            raise ValueError('dynamic_cdist_chunk_size must be positive')
+
+        nearest_indices = []
+        with torch.no_grad():
+            query = query_points.detach().float()
+            reference = reference_points.detach().float()
+            for query_start in range(0, query.shape[0], chunk_size):
+                query_chunk = query[query_start:query_start + chunk_size]
+                best_distance = query_chunk.new_full(
+                    (query_chunk.shape[0],), float('inf'))
+                best_index = torch.zeros(
+                    query_chunk.shape[0], device=query.device,
+                    dtype=torch.long)
+                for ref_start in range(0, reference.shape[0], chunk_size):
+                    reference_chunk = reference[
+                        ref_start:ref_start + chunk_size]
+                    distance = torch.cdist(
+                        query_chunk, reference_chunk, p=1)
+                    chunk_distance, chunk_index = distance.min(dim=1)
+                    update = chunk_distance < best_distance
+                    best_distance = torch.where(
+                        update, chunk_distance, best_distance)
+                    best_index = torch.where(
+                        update, chunk_index + ref_start, best_index)
+                nearest_indices.append(best_index)
+        return torch.cat(nearest_indices)
 
     def _loss_ego(self, output):
         target = output.get('gt_relative_pose')
@@ -699,6 +735,22 @@ class OPUSHead(BaseModule):
             output['query_motion'][:, :overlap],
             previous_output['query_motion'][:, :overlap])
 
+    @staticmethod
+    def _role_diagnostics(output, cache):
+        target = cache['role_target'].bool()
+        valid = cache['role_valid']
+        prediction = output['role_pred'].squeeze(-1) >= 0.5
+        correct = ((prediction == target) & valid).sum()
+        accuracy = correct.to(output['role_pred'].dtype) / \
+            valid.sum().clamp_min(1)
+        dynamic_ratio = output['role_pred'].mean()
+        dynamic_from_static, static_from_dynamic = output['interaction_gates']
+        return dict(
+            role_accuracy=accuracy.detach(),
+            dynamic_ratio=dynamic_ratio.detach(),
+            gate_dynamic_from_static=dynamic_from_static.detach(),
+            gate_static_from_dynamic=static_from_dynamic.detach())
+
     def loss_future(self,
                     voxel_semantics,
                     all_refine_pts,
@@ -727,6 +779,9 @@ class OPUSHead(BaseModule):
                             config.get('lambda_role', 0.5) * role_loss
                         loss_dict[prefix + '.loss_ego'] = \
                             config.get('lambda_ego', 1.0) * ego_loss
+                        for name, value in self._role_diagnostics(
+                                output, cache).items():
+                            loss_dict[prefix + '.' + name] = value
                     else:
                         role_zero = output['role_logits'].sum() * 0
                         loss_dict[prefix + '.loss_role'] = role_zero
@@ -769,6 +824,9 @@ class OPUSHead(BaseModule):
                 loss_dict[prefix + '.loss_leak'] = geometry_weight * \
                     config.get('lambda_leak', 0.05) * \
                     self._loss_leak(output, cache)
+                for name, value in self._role_diagnostics(
+                        output, cache).items():
+                    loss_dict[prefix + '.' + name] = value
                 previous_output = output
         return loss_dict
 
