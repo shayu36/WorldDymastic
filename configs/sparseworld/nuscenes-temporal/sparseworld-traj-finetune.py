@@ -323,6 +323,10 @@ runner = dict(type='EpochBasedRunner', max_epochs=64)
 # custom hooks
 custom_hooks = [dict(type='CustomSetEpochInfoHook')]
 
+evaluation = dict(
+    planning_output_path=(
+        'work_dirs/sparseworld-traj-finetune/eval/output_data.pkl'))
+
 log_config = dict(
     interval=50,
 )

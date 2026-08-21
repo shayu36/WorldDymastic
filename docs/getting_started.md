@@ -10,10 +10,21 @@ bash ./tools/dist_train.sh ./configs/sparseworld/nuscenes-temporal/sparseworld-t
 **b. Test**
 
 Following the [PreWorld](https://github.com/getterupper/PreWorld) codebase, we evaluate occupancy forecasting and trajectory planning metrics separately. The occupancy prediction metrics are as follows:
+Single-GPU evaluation:
 ```
-python tools/test.py configs/sparseworld/nuscenes-temporal/sparse-occ-traj-finetune.py checkpoint.pth
+PYTHONPATH="$(pwd)" python tools/test_temporal.py configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune.py checkpoint.pth
 ```
-This will output the mIoU and IoU scores, and also generate **output_data.pkl** in the **SparseWorld/admlp** directory, which stores the generated trajectories. 
+
+Distributed evaluation (for example, two GPUs):
+```
+bash tools/dist_test_temporal.sh configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune.py checkpoint.pth 2
+```
+
+Set `PYTHON_BIN` when the desired interpreter is not the active shell Python,
+for example `PYTHON_BIN=/path/to/env/bin/python bash tools/dist_test_temporal.sh ...`.
+
+This outputs the mIoU and IoU scores and writes the generated trajectories to
+**work_dirs/sparseworld-traj-finetune/eval/output_data.pkl** by default.
 
 Then, the planning scores are evaluated as follows:
 

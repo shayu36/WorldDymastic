@@ -130,6 +130,31 @@ def test_token():
         return res
 
 
+def _unpack_temporal_evaluation_results(results):
+    """Normalize temporal evaluation input to occupancy and trajectories."""
+    is_paired_result = (
+        isinstance(results, (list, tuple)) and len(results) == 2
+        and isinstance(results[0], (list, tuple))
+        and isinstance(results[1], (list, tuple)))
+    if is_paired_result:
+        occupancy_results, trajectory_results = results
+        if trajectory_results and \
+                len(trajectory_results) != len(occupancy_results):
+            raise ValueError(
+                'Occupancy and trajectory result counts must match, got '
+                f'{len(occupancy_results)} and {len(trajectory_results)}.')
+        return occupancy_results, trajectory_results or None
+    return results, None
+
+
+def _dump_planning_results(results, output_path):
+    output_path = os.path.abspath(os.path.expanduser(output_path))
+    mmcv.mkdir_or_exist(os.path.dirname(output_path))
+    with open(output_path, 'wb') as file:
+        pickle.dump(results, file=file)
+    return output_path
+
+
 @DATASETS.register_module()
 class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
     def __init__(self, 
@@ -492,11 +517,8 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             use_image_mask=False)
 
         print('\nStarting Evaluation...')
-        if len(occ_results)==2:
-            occ_results,pred_trajs = occ_results[0],occ_results[1]
-        else:
-            occ_results = occ_results[0]
-            pred_trajs = None
+        occ_results, pred_trajs = _unpack_temporal_evaluation_results(
+            occ_results)
 
         out_pkl = {}
         for index, occ_pred in enumerate(tqdm(occ_results)):
@@ -522,7 +544,11 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
                 curr_mask_camera = curr_occ_gt['mask_camera'].astype(bool)
 
             if pred_trajs is not None:
-                out_pkl[curr_info['token']] = np.cumsum(pred_trajs[index].cpu().numpy(),axis=1)
+                trajectory = pred_trajs[index]
+                if torch.is_tensor(trajectory):
+                    trajectory = trajectory.detach().cpu().numpy()
+                out_pkl[curr_info['token']] = np.cumsum(
+                    np.asarray(trajectory), axis=1)
             gt_semantics_temp[0] = curr_gt_semantics
             mask_lidar_temp[0] = curr_mask_lidar
             mask_camera_temp[0] = curr_mask_camera
@@ -554,8 +580,12 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             self.occ_eval_metrics.add_batch(occ_pred, gt_semantics_temp, mask_lidar_temp, mask_camera_temp)
 
         if pred_trajs is not None:
-            with open('admlp/output_data.pkl', 'wb') as f:
-                pickle.dump(out_pkl, file=f)
+            planning_output_path = eval_kwargs.get(
+                'planning_output_path',
+                'work_dirs/evaluation/output_data.pkl')
+            planning_output_path = _dump_planning_results(
+                out_pkl, planning_output_path)
+            print(f'Planning predictions saved to {planning_output_path}')
         iou_res_list = self.occ_eval_metrics.count_iou()
         mIoU_1s, miou_res_list = self.occ_eval_metrics.count_miou()
         dynamic_miou = self.occ_eval_metrics.count_group_miou(

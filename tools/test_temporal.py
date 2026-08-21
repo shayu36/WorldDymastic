@@ -122,7 +122,8 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument(
+        '--local-rank', '--local_rank', dest='local_rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)
@@ -249,16 +250,19 @@ def main():
         # outputs = multi_gpu_test(model, data_loader, args.dump_dir,
         #                         args.gpu_collect
         #                         )
-        outputs = multi_gpu_test_temporal(model, data_loader, args.dump_dir,
-                                args.gpu_collect
-                                )
+        outputs = multi_gpu_test_temporal(
+            model,
+            data_loader,
+            dump_dir=args.dump_dir,
+            tmpdir=args.tmpdir,
+            gpu_collect=args.gpu_collect)
 
 
 
 
     rank, _ = get_dist_info()
     if rank == 0:
-        kwargs = {} if args.eval_options is None else args.eval_optionsz
+        kwargs = {} if args.eval_options is None else args.eval_options
         if args.eval:
             eval_kwargs = cfg.get('evaluation', {}).copy()
             # hard-code way to remove EvalHook args

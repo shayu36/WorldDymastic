@@ -14,6 +14,41 @@ import torch.distributed as dist
 from mmcv.runner import get_dist_info
 from thop import profile
 
+
+TEMPORAL_OCC_HORIZONS = (0, 2, 4, 6)
+
+
+def _format_temporal_prediction(result):
+    """Convert a temporal model result into one per-sample result pair."""
+    if result.get('semantic_occ_4s') is None:
+        horizons = (0, )
+    else:
+        horizons = TEMPORAL_OCC_HORIZONS
+
+    occupancy = np.stack([
+        result[f'semantic_occ_{horizon}s'][0] for horizon in horizons
+    ], axis=0)
+    trajectory = result.get('pred_traj')
+    if torch.is_tensor(trajectory):
+        trajectory = trajectory.detach().cpu()
+    return occupancy, trajectory
+
+
+def _split_temporal_collected_results(results):
+    """Restore the dataset evaluation contract after distributed gathering."""
+    if results is None:
+        return None
+
+    occupancy_results = [result[0] for result in results]
+    trajectory_results = [result[1] for result in results
+                          if result[1] is not None]
+    if trajectory_results and len(trajectory_results) != len(results):
+        raise ValueError(
+            'Temporal predictions must either all include trajectories or all '
+            'omit them.')
+    return [occupancy_results, trajectory_results]
+
+
 def single_gpu_test(model, data_loader, dump=False):
     model.eval()
     results = [[],[]]
@@ -26,23 +61,10 @@ def single_gpu_test(model, data_loader, dump=False):
             result = model(return_loss=False, rescale=True, **data)
             # flops,params = profile(model.module,inputs=dict(return_loss=False, rescale=True, **data))
 
-        if result.get('semantic_occ_4s',None) is not None:
-            result = [np.stack([
-                result['semantic_occ_0s'][0],
-                result['semantic_occ_2s'][0],
-                result['semantic_occ_4s'][0],
-                result['semantic_occ_6s'][0],
-            ],axis=0),result['pred_traj']]
-            for i in range(2):
-                results[i].append(result[i])
-        else:
-            result = [np.stack(
-                [
-                    result['semantic_occ_0s'][0],
-
-                ],axis=0)]
-            for i in range(1):
-                results[i].append(result[i])
+        occupancy, trajectory = _format_temporal_prediction(result)
+        results[0].append(occupancy)
+        if trajectory is not None:
+            results[1].append(trajectory)
 
 
         if dump:
@@ -142,7 +164,7 @@ def multi_gpu_test(model, data_loader, dump_dir=None, tmpdir=None, gpu_collect=F
 def collect_results_cpu(result_part, size, tmpdir=None):
     rank, world_size = get_dist_info()
     # create a tmp dir if it is not specified
-    tmpdir=None
+    remove_tmpdir = tmpdir is None
     if tmpdir is None:
         MAX_LEN = 512
         # 32 is whitespace
@@ -172,14 +194,17 @@ def collect_results_cpu(result_part, size, tmpdir=None):
         for i in range(world_size):
             part_file = osp.join(tmpdir, f'part_{i}.pkl')
             part_list.append(mmcv.load(part_file))
+            os.remove(part_file)
         # sort the results
         ordered_results = []
         for res in zip(*part_list):
             ordered_results.extend(list(res))
         # the dataloader may pad some samples
         ordered_results = ordered_results[:size]
-        # remove tmp dir
-        shutil.rmtree(tmpdir)
+        # Only remove directories created by this function. A caller-provided
+        # directory may contain unrelated files and must be preserved.
+        if remove_tmpdir:
+            shutil.rmtree(tmpdir)
         return ordered_results
 
 
@@ -234,14 +259,8 @@ def multi_gpu_test_temporal(model, data_loader, dump_dir=None, tmpdir=None, gpu_
         with torch.no_grad():
             result = model(return_loss=False, rescale=True, **data)
         
-        # result = result['geo_occ']
-        # result = result['semantic_occ']
-        result = [np.stack([
-            result['semantic_occ_0s'][0], 
-            result['semantic_occ_2s'][0],
-            result['semantic_occ_4s'][0], 
-            result['semantic_occ_6s'][0]
-        ], axis=0)]
+        occupancy, trajectory = _format_temporal_prediction(result)
+        result = [(occupancy, trajectory)]
 
         if dump_dir is not None:
             scene_name = data['img_metas'][0].data[0][0]['scene_name']
@@ -250,7 +269,7 @@ def multi_gpu_test_temporal(model, data_loader, dump_dir=None, tmpdir=None, gpu_
             # dump occupancy prediction
             save_path = os.path.join(dump_dir, scene_name)
             os.makedirs(save_path, exist_ok=True)
-            np.save(os.path.join(save_path, '%s.npy'%frame_idx), result)
+            np.save(os.path.join(save_path, '%s.npy'%frame_idx), occupancy)
 
             # dump images
             # imgs = data['img_inputs'][0][0][0]
@@ -275,7 +294,7 @@ def multi_gpu_test_temporal(model, data_loader, dump_dir=None, tmpdir=None, gpu_
         results = collect_results_gpu(results, len(dataset))
     else:
         results = collect_results_cpu(results, len(dataset), tmpdir)
-    return results
+    return _split_temporal_collected_results(results)
 
 def multi_gpu_test_traj(model, data_loader, dump_dir=None, tmpdir=None, gpu_collect=False):
     model.eval()

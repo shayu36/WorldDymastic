@@ -3,9 +3,22 @@
 import numpy as np
 import torch
 
-from . import bev_pool_v2_ext
+try:
+    from . import bev_pool_v2_ext
+    _BEV_POOL_IMPORT_ERROR = None
+except ImportError as error:
+    bev_pool_v2_ext = None
+    _BEV_POOL_IMPORT_ERROR = error
 
 __all__ = ['bev_pool_v2', 'TRTBEVPoolv2']
+
+
+def _require_bev_pool_v2_ext():
+    if bev_pool_v2_ext is None:
+        raise RuntimeError(
+            'bev_pool_v2_ext is required for BEV pooling. Build it from the '
+            'repository root with `python setup.py build_ext --inplace`.') \
+            from _BEV_POOL_IMPORT_ERROR
 
 
 class QuickCumsumCuda(torch.autograd.Function):
@@ -16,6 +29,7 @@ class QuickCumsumCuda(torch.autograd.Function):
     @staticmethod
     def forward(ctx, depth, feat, ranks_depth, ranks_feat, ranks_bev,
                 bev_feat_shape, interval_starts, interval_lengths):
+        _require_bev_pool_v2_ext()
         ranks_bev = ranks_bev.int()
         depth = depth.contiguous().float()
         feat = feat.contiguous().float()
@@ -42,6 +56,7 @@ class QuickCumsumCuda(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, out_grad):
+        _require_bev_pool_v2_ext()
         ranks_bev, depth, feat, ranks_feat, ranks_depth = ctx.saved_tensors
 
         order = ranks_feat.argsort()
