@@ -120,10 +120,23 @@ def evaluate(final_traj_path=None, checkpoint_path=None, dataroot=None, online=F
         print(f'{key} : {value.item()}')
 
 if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument(
+        '--trajectory-pkl',
+        default='../../paddle/model/output_data.pkl',
+        help='Pickle file containing token -> predicted trajectory.')
+    parser.add_argument(
+        '--online', action='store_true',
+        help='Evaluate with the STP3 model instead of a trajectory pickle.')
+    parser.add_argument('--checkpoint-path', default='ckpts/STP3_plan.ckpt')
+    parser.add_argument('--dataroot', default='data/nuscenes')
+    args = parser.parse_args()
 
-    online = False
-    final_traj_path = '../../paddle/model/output_data.pkl'
-    if not online:
-        evaluate(final_traj_path=final_traj_path, online = False)
+    if args.online:
+        evaluate(
+            final_traj_path=args.trajectory_pkl,
+            checkpoint_path=args.checkpoint_path,
+            dataroot=args.dataroot,
+            online=True)
     else:
-        evaluate(final_traj_path=final_traj_path, checkpoint_path='ckpts/STP3_plan.ckpt', dataroot='data/nuscenes', online=True)
+        evaluate(final_traj_path=args.trajectory_pkl, online=False)

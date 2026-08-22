@@ -137,6 +137,11 @@ class SparseWorld4DTraj(OPUS):
         self.role_teacher_forcing_ratio = 0.0
         self.ego_teacher_forcing_ratio = 0.0
         if self.dsqe_enabled:
+            # DSQE predicts future semantics with semantic_correction_head.
+            # The legacy branch is only used by the DSQE-off baseline path;
+            # leaving it trainable makes DDP require gradients that this
+            # forward graph can never produce.
+            self.cls_branch.requires_grad_(False)
             self._init_dsqe(drop_out)
 
     def _init_dsqe(self, drop_out):

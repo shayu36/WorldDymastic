@@ -50,3 +50,6 @@ admlp/
 *.npz
 *.bin
 *.pcd
+
+# training/eval run logs
+logs

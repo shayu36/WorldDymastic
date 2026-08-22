@@ -26,6 +26,7 @@ def test_temporal_prediction_contract_preserves_occupancy_and_trajectory():
     occupancy, trajectory = _format_temporal_prediction(_model_result(3))
 
     assert occupancy.shape == (4, 2, 3, 1)
+    assert occupancy.dtype == np.uint8
     assert trajectory.shape == (1, 6, 2)
     assert trajectory.device.type == 'cpu'
 

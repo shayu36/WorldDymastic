@@ -21,8 +21,6 @@ import pickle
 
 from ..core.bbox import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
 
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
 nusc_class_nums = torch.Tensor([
     2854504, 7291443, 141614, 4239939, 32248552, 
     1583610, 364372, 2346381, 582961, 4829021, 

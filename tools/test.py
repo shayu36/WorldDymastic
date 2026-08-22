@@ -13,7 +13,8 @@ from mmcv.runner import (get_dist_info, init_dist, load_checkpoint,
                          wrap_fp16_model)
 
 import mmdet
-from mmdet3d.apis import single_gpu_test, multi_gpu_test
+from mmdet3d.apis import (
+    single_gpu_test, multi_gpu_test, multi_gpu_test_temporal)
 
 
 from mmdet3d.datasets import build_dataloader, build_dataset
@@ -244,7 +245,15 @@ def main():
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = multi_gpu_test(
+        # Temporal trajectory models return semantic_occ_{0,2,4,6}s and
+        # pred_traj.  The legacy collector expects result['semantic_occ'] and
+        # silently routes this model into the wrong evaluation contract.
+        is_temporal_model = (
+            cfg.model.type.endswith('4DTraj') or
+            cfg.model.get('dsqe_cfg', None) is not None)
+        test_fn = multi_gpu_test_temporal if is_temporal_model \
+            else multi_gpu_test
+        outputs = test_fn(
             model,
             data_loader,
             dump_dir=args.dump_dir,

@@ -25,12 +25,18 @@ def _format_temporal_prediction(result):
     else:
         horizons = TEMPORAL_OCC_HORIZONS
 
+    # Semantic occupancy labels are in [0, 17].  Keeping the model's usual
+    # int64 NumPy dtype makes a full temporal validation set consume tens of
+    # gigabytes before distributed result collection even begins.
     occupancy = np.stack([
         result[f'semantic_occ_{horizon}s'][0] for horizon in horizons
-    ], axis=0)
+    ], axis=0).astype(np.uint8, copy=False)
     trajectory = result.get('pred_traj')
     if torch.is_tensor(trajectory):
         trajectory = trajectory.detach().cpu()
+    if trajectory is not None:
+        if isinstance(trajectory, np.ndarray):
+            trajectory = trajectory.astype(np.float32, copy=False)
     return occupancy, trajectory
 
 

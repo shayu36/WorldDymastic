@@ -24,6 +24,13 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
     model = build_model(
         cfg.model, train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
+    legacy_cls_parameters = [
+        parameter for name, parameter in model.named_parameters()
+        if name.startswith('cls_branch.')
+    ]
+    assert len(legacy_cls_parameters) == 6
+    assert not any(
+        parameter.requires_grad for parameter in legacy_cls_parameters)
     model.init_weights()
     model.set_epoch(cfg.finetune_epoch + 1)
     model.cuda().train()
@@ -100,6 +107,23 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
     assert role_gradients
     assert all(torch.isfinite(gradient).all()
                for gradient in role_gradients)
+
+    missing_gradients = [
+        name for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert not missing_gradients
+
+    for prefix in (
+            'role_router.', 'yaw_head.', 'dual_evolution.',
+            'dual_interaction.', 'joint_refine.',
+            'semantic_correction_head.'):
+        gradients = [
+            parameter.grad for name, parameter in model.named_parameters()
+            if name.startswith(prefix) and parameter.requires_grad
+        ]
+        assert gradients, prefix
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 if __name__ == '__main__':

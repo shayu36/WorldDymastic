@@ -211,7 +211,7 @@ bda_aug_conf = dict(
     flip_dy_ratio=0.5)
 
 pretrain = False
-# find_unused_parameters = True
+find_unused_parameters = False
 
 ida_aug_conf = {
     'resize_lim': (0.38,0.55),
