@@ -11,6 +11,9 @@ from mmcv.runner import (HOOKS, DistSamplerSeedHook, EpochBasedRunner,
 from mmcv.utils import build_from_cfg
 from torch import distributed as dist
 
+from mmdet3d.core.evaluation import (
+    SparseWorldDistEvalHook, SparseWorldEvalHook)
+from mmdet3d.core.optimizer import TrainableOnlyOptimizerConstructor  # noqa: F401
 from mmdet3d.datasets import build_dataset
 from mmdet3d.utils import find_latest_checkpoint
 from mmdet.core import DistEvalHook as MMDET_DistEvalHook
@@ -22,6 +25,47 @@ from mmseg.core import DistEvalHook as MMSEG_DistEvalHook
 from mmseg.core import EvalHook as MMSEG_EvalHook
 from mmseg.datasets import build_dataloader as build_mmseg_dataloader
 from mmseg.utils import get_root_logger as get_mmseg_root_logger
+
+
+def _select_detector_eval_hook(model, distributed):
+    """Route SparseWorld models to the dictionary-aware eval hook."""
+
+    model = model.module if hasattr(model, 'module') else model
+    if getattr(model, 'uses_sparseworld_eval_api', False):
+        return SparseWorldDistEvalHook if distributed else SparseWorldEvalHook
+    return MMDET_DistEvalHook if distributed else MMDET_EvalHook
+
+
+def _select_detector_optimizer_target(model, optimizer_cfg):
+    """Select a staged-training optimizer target when requested.
+
+    DSQE uses the full detector target.  The additional branches mirror the
+    project training workflow for configurations that expose Query Memory
+    fine-tuning flags, without changing ordinary detector/DSQE runs.
+    """
+
+    model_for_optimizer = model.module if hasattr(model, 'module') else model
+    if getattr(model_for_optimizer, 'memory_finetune_mode', False):
+        query_memory = getattr(model_for_optimizer, 'query_memory', None)
+        if query_memory is None:
+            raise RuntimeError(
+                'memory_finetune_mode has no query_memory optimizer target')
+        return model_for_optimizer, query_memory
+
+    joint_mode = getattr(
+        model_for_optimizer, 'memory_joint_finetune_mode', False)
+    phase2_mode = getattr(
+        model_for_optimizer, 'memory_phase2_finetune_mode', False)
+    if joint_mode or phase2_mode:
+        mode_name = (
+            'memory_phase2_finetune_mode'
+            if phase2_mode else 'memory_joint_finetune_mode')
+        constructor = optimizer_cfg.get('constructor', None)
+        if constructor != 'TrainableOnlyOptimizerConstructor':
+            raise RuntimeError(
+                f'{mode_name} requires optimizer.constructor='
+                '"TrainableOnlyOptimizerConstructor"')
+    return model_for_optimizer, model
 
 
 def init_random_seed(seed=None, device='cuda'):
@@ -112,7 +156,7 @@ def train_segmentor(model,
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
-    # build runner
+    # Segmentor training keeps MMCV's standard optimizer path.
     optimizer = build_optimizer(model, cfg.optimizer)
 
     if cfg.get('runner') is None:
@@ -232,8 +276,12 @@ def train_detector(model,
         model = MMDataParallel(
             model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
-    # build runner
-    optimizer = build_optimizer(model, cfg.optimizer)
+    # MMCV's default optimizer constructor includes frozen parameters, so
+    # Memory-only targets query_memory directly while broader tuning modes
+    # require the trainable-only constructor.
+    model_for_optimizer, optimizer_target = \
+        _select_detector_optimizer_target(model, cfg.optimizer)
+    optimizer = build_optimizer(optimizer_target, cfg.optimizer)
 
     if 'runner' not in cfg:
         cfg.runner = {
@@ -299,7 +347,8 @@ def train_detector(model,
             shuffle=False)
         eval_cfg = cfg.get('evaluation', {})
         eval_cfg['by_epoch'] = cfg.runner['type'] != 'IterBasedRunner'
-        eval_hook = MMDET_DistEvalHook if distributed else MMDET_EvalHook
+        eval_hook = _select_detector_eval_hook(model_for_optimizer,
+                                               distributed)
         # In this PR (https://github.com/open-mmlab/mmcv/pull/1193), the
         # priority of IterTimerHook has been modified from 'NORMAL' to 'LOW'.
         runner.register_hook(
@@ -316,6 +365,13 @@ def train_detector(model,
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from,revise_keys=cfg.get('revise_keys',[(r'^module.', '')]))
+    model_for_checks = runner.model.module if hasattr(
+        runner.model, 'module') else runner.model
+    if hasattr(model_for_checks, 'validate_query_memory_training_setup'):
+        model_for_checks.validate_query_memory_training_setup(
+            optimizer=runner.optimizer,
+            optimizer_cfg=cfg.optimizer,
+            logger=logger)
     runner.run(data_loaders, cfg.workflow)
 
 

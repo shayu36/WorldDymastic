@@ -40,6 +40,10 @@ def _linear_schedule(initial_value, epoch, start_epoch, end_epoch):
 
 @DETECTORS.register_module()
 class SparseWorld4DTraj(OPUS):
+    # The model returns temporal occupancy/trajectory dictionaries rather
+    # than the generic detector result list expected by MMDetection hooks.
+    uses_sparseworld_eval_api = True
+
     def __init__(self,
                  out_dim=32,
                  dataset_type='Nuscenes',
