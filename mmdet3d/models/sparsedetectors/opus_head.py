@@ -446,10 +446,36 @@ class OPUSHead(BaseModule):
                 device=gt_points.device).bool()
         if centers.numel() == 0:
             return role_target, role_valid
-        distances = torch.cdist(gt_points[:, :2], centers[:, :2], p=2)
-        nearest_distance, nearest_actor = distances.min(dim=1)
-        matched = (nearest_distance <= radius[nearest_actor]) & \
-            actor_valid[nearest_actor] & ~static_mask
+        dims = role_metadata.get('dims')
+        yaw = role_metadata.get('yaw')
+        if dims is not None and yaw is not None and dims.numel() > 0:
+            dims = dims.to(device=gt_points.device, dtype=gt_points.dtype)
+            yaw = yaw.to(device=gt_points.device, dtype=gt_points.dtype)
+            delta = gt_points[:, None, :3] - centers[None, :, :3]
+            cos_yaw = yaw.cos()[None, :]
+            sin_yaw = yaw.sin()[None, :]
+            # Rotate points into each actor's local box frame.
+            local_x = cos_yaw * delta[..., 0] + sin_yaw * delta[..., 1]
+            local_y = -sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1]
+            inside = (local_x.abs() <= dims[None, :, 0] * 0.5) & \
+                (local_y.abs() <= dims[None, :, 1] * 0.5)
+            if gt_points.shape[-1] >= 3 and dims.shape[-1] >= 3:
+                inside = inside & (
+                    delta[..., 2].abs() <= dims[None, :, 2] * 0.5)
+            # Select the nearest actor among boxes that actually contain the
+            # point.  This avoids assigning the rounded box corners or a
+            # distant overlapping actor to a voxel.
+            center_distance = torch.cdist(
+                gt_points[:, :2], centers[:, :2], p=2)
+            center_distance = center_distance.masked_fill(~inside, float('inf'))
+            nearest_distance, nearest_actor = center_distance.min(dim=1)
+            matched = torch.isfinite(nearest_distance) & \
+                actor_valid[nearest_actor] & ~static_mask
+        else:
+            distances = torch.cdist(gt_points[:, :2], centers[:, :2], p=2)
+            nearest_distance, nearest_actor = distances.min(dim=1)
+            matched = (nearest_distance <= radius[nearest_actor]) & \
+                actor_valid[nearest_actor] & ~static_mask
         role_target[matched] = actor_role[nearest_actor[matched]]
         role_valid[matched] = True
         return role_target, role_valid
@@ -687,11 +713,19 @@ class OPUSHead(BaseModule):
             pred_role = output['role_pred'][batch_index].reshape(-1)
             # Softly weight every valid candidate.  There is intentionally no
             # ``pred_role > 0.5`` branch, so low-confidence roles still train.
-            dynamic_weight = pred_role * role_target * role_valid.to(pred_role.dtype)
+            # Keep a non-zero floor for low-confidence roles and normalize by
+            # GT role mass rather than the same prediction-dependent weight.
+            # This preserves a useful geometric gradient even when every
+            # predicted role is below 0.5.
+            dynamic_weight = role_target * (
+                0.25 + 0.75 * pred_role) * \
+                role_valid.to(pred_role.dtype)
             dynamic_weight = dynamic_weight[:pred_error.shape[0]]
             pred_distance_sum = pred_distance_sum + \
                 (pred_error * dynamic_weight).sum()
-            pred_count = pred_count + dynamic_weight.sum()
+            pred_count = pred_count + (
+                role_target[:pred_error.shape[0]] *
+                role_valid[:pred_error.shape[0]].to(pred_role.dtype)).sum()
 
             gt_role_targets = cache.get('gt_role_target_list')
             gt_role_valids = cache.get('gt_role_valid_list')
@@ -710,15 +744,20 @@ class OPUSHead(BaseModule):
                         dynamic_gt_mask]
                     dynamic_gt_role = gt_role_target[dynamic_gt_mask]
                     pred_points = refine_pts_flat[batch_index]
-                    nearest_gt = self._chunked_nearest_indices(
-                        pred_points, dynamic_gt_points,
+                    # GT -> prediction coverage: every moving GT point must
+                    # find a predicted point.  The previous implementation
+                    # repeated the prediction -> GT direction and could
+                    # therefore miss uncovered moving regions.
+                    nearest_pred = self._chunked_nearest_indices(
+                        dynamic_gt_points, pred_points,
                         self.dsqe_cfg.get('dynamic_cdist_chunk_size', 1024))
-                    gt_error = (pred_points -
-                                dynamic_gt_points[nearest_gt]).abs().mean(dim=-1)
-                    gt_weight = pred_role * dynamic_gt_role[nearest_gt]
+                    gt_error = (dynamic_gt_points -
+                                pred_points[nearest_pred]).abs().mean(dim=-1)
+                    gt_weight = dynamic_gt_role * (
+                        0.25 + 0.75 * pred_role[nearest_pred])
                     gt_distance_sum = gt_distance_sum + \
                         (gt_weight * gt_error).sum()
-                    gt_count = gt_count + gt_weight.sum()
+                    gt_count = gt_count + dynamic_gt_role.sum()
 
             labels = cache['labels_list'][batch_index]
             semantic_dynamic_mask = self._labels_in_classes(labels, dynamic_ids)
@@ -929,15 +968,17 @@ class OPUSHead(BaseModule):
             gt_points = cache['gt_points_list'][batch_index][dynamic_mask]
             gt_role = gt_role[dynamic_mask]
             batch_points = output['points_metric'][batch_index].reshape(-1, 3)
-            nearest = OPUSHead._chunked_nearest_indices(
-                batch_points.detach(), gt_points.detach(),
+            nearest_pred = OPUSHead._chunked_nearest_indices(
+                gt_points.detach(), batch_points.detach(),
                 getattr(self, 'dsqe_cfg', {}).get(
                     'dynamic_cdist_chunk_size', 1024)
                 if hasattr(self, 'dsqe_cfg') else 1024)
-            dynamic_errors.append(((batch_points - gt_points[nearest]).abs(),
-                                   output['role_pred'][batch_index].reshape(
-                                       -1).detach() *
-                                   gt_role[nearest].detach()))
+            matched_points = batch_points[nearest_pred]
+            matched_roles = output['role_pred'][batch_index].reshape(
+                -1).detach()[nearest_pred]
+            dynamic_errors.append(((matched_points - gt_points).abs(),
+                                   (0.25 + 0.75 * matched_roles) *
+                                   gt_role.detach()))
         if dynamic_errors:
             dynamic_error = torch.cat([value for value, _ in dynamic_errors],
                                       dim=0)

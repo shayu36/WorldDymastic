@@ -73,6 +73,14 @@ class DefaultFormatBundle(object):
             results['gt_semantic_seg'] = DC(
                 to_tensor(results['gt_semantic_seg'][None, ...]), stack=True)
 
+        # The number of actors differs between scenes.  Keep these fields as
+        # non-stacked DataContainers so a batch with samples containing
+        # different actor counts remains valid (the model consumes them as a
+        # ragged per-sample sequence).
+        for key in ('temporal_agent_boxes', 'temporal_agent_feats'):
+            if key in results and not isinstance(results[key], DC):
+                results[key] = DC(to_tensor(results[key]), stack=False)
+
         return results
 
     def __repr__(self):

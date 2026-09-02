@@ -51,7 +51,11 @@ v^{rel}=\frac{\|P_{t+1}^{GT}-Warp(P_t^{GT})\|}{\Delta t},\qquad
 r^{GT}=\sigma((v^{rel}-\tau)/T)
 \]
 
-点只有在距离某个 actor 中心不超过保守 footprint 半径且 actor 轨迹有效时才获得 actor 角色；无法匹配的动态点 `role_valid=False`。明确静态类点角色为 0 并保持有效。没有 actor 元数据时，动态类别不会伪造为有效动态 GT。
+数据中的未来轨迹按相邻帧增量解释：第 `k` 个未来框中心使用前 `k` 段位移的累计和，速度使用当前段瞬时速度或累计位移的时间平均，不能把第 `k` 段增量直接当作绝对偏移。actor 中心先经过统一的 GT 自车变换补偿，再用于匹配。对于完整 box 字段，匹配使用带 yaw 的旋转矩形/长方体内部判断；缺少尺寸或朝向字段时才回退到兼容半径。无法匹配的动态点 `role_valid=False`。明确静态类点角色为 0 并保持有效。没有 actor 元数据时，动态类别不会伪造为有效动态 GT。
+
+`temporal_agent_boxes` 和 `temporal_agent_feats` 在格式化阶段使用
+`DataContainer(stack=False)`，模型侧通过 ragged per-sample sequence 消费，因此每卡
+`samples_per_gpu=2` 时不同样本的 actor 数量不会触发 `torch.stack` 形状错误。
 
 角色日志扩展为 `dynamic_precision`、`dynamic_recall`、`dynamic_f1`、`gt_dynamic_ratio`、`pred_dynamic_ratio`、`mean_role_on_moving_gt`、`mean_role_on_static_gt`、`role_saturation_low/high`，并保留原 `role_accuracy`、`dynamic_ratio` 和交互门控值。
 普通推理只使用预测 pose；未来 GT pose/occupancy 仅在训练或显式
@@ -66,6 +70,10 @@ r^{GT}=\sigma((v^{rel}-\tau)/T)
 \]
 
 动态分支的 z 分量固定为 0；静态分支乘以小的 `static_point_delta_scale`。点级 `point_role` 是最终位置混合权重，Query 级角色仅参与上下文、双流交互和角色一致性损失。旧的 `query_motion` 不再作为完整位移叠加，`vel_branch` 只在 BaseLine carrier 单步中执行一次。
+
+动态几何损失同时保留预测→GT项和真正的 GT→预测覆盖项。后者对每个有效动态 GT
+点寻找最近预测点；两项均使用带下限的连续角色权重，不依赖 `pred_role > 0.5`，并以
+GT角色质量归一化，确保低角色概率时仍有稳定几何梯度。
 
 每个未来步还记录动态/静态 residual 的 xyz 均值、绝对均值和 95% 分位数。
 同时记录 `query_motion` 的 xyz 均值/P95，以及基于有效运动状态标签的
@@ -101,7 +109,7 @@ DSQE Stage 1 不再在 `set_epoch()` 中执行 `num_stamps_all[:] = 1`，也不�
 /data/jxy/projects/env/bin/python -m pytest -q tests/test_models
 ```
 
-结果：`28 passed`。测试覆盖 BaseLine 残差恒等性、零初始化梯度、逐时刻语义独立性、运动状态角色匹配、混合 Query 点级路由、动态损失软死区、重复位移防止、TASS 固定和旧 state dict 兼容；同时通过已有 DSQE 两步 CUDA smoke test。
+结果：`33 passed`。新增测试覆盖相邻帧 actor 位移累计、旋转 box footprint、ragged actor batch=2 的 mmcv collate、GT→预测覆盖，以及此前已有的 BaseLine 残差恒等性、零初始化梯度、逐时刻语义独立性、运动状态角色匹配、混合 Query 点级路由、动态损失软死区、重复位移防止、TASS 固定和旧 state dict 兼容；同时通过已有 DSQE 两步 CUDA smoke test。
 
 另外已执行相关文件 `py_compile` 检查通过。尚未执行完整训练、4219 样本验证、真实多进程 rank divergence 注入测试和需要完整 nuScenes 数据的端到端指标验证。
 

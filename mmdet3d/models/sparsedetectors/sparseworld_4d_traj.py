@@ -451,6 +451,14 @@ class SparseWorld4DTraj(OPUS):
 
     @staticmethod
     def _to_batch_tensor(value, device, dtype):
+        # ``DataContainer(stack=False)`` values are intentionally kept as a
+        # per-sample list by the dataloader.  This helper is used for fields
+        # that are guaranteed to have a rectangular batch shape (poses,
+        # ego-state tensors, etc.); variable-length actor fields use
+        # ``_to_batch_sequence`` below instead of being stacked here.
+        if hasattr(value, 'data') and not isinstance(value, torch.Tensor):
+            value = value.data
+
         if isinstance(value, torch.Tensor):
             tensor = value.to(device=device, dtype=dtype)
         elif isinstance(value, (list, tuple)) and value and \
@@ -464,6 +472,62 @@ class SparseWorld4DTraj(OPUS):
         if tensor.ndim == 2:
             tensor = tensor.unsqueeze(0)
         return tensor
+
+    @staticmethod
+    def _to_batch_sequence(value, device, dtype):
+        """Convert a possibly ragged field into one tensor per sample.
+
+        Actor boxes and actor attributes have a variable first dimension (the
+        number of actors in a scene), so they must not be passed through
+        ``torch.stack``.  The returned list is deliberately kept ragged and
+        is consumed sample-by-sample by the role target builder.
+        """
+        if value is None:
+            return None
+        if hasattr(value, 'data') and not isinstance(value, torch.Tensor):
+            value = value.data
+
+        # mmcv's ragged collate stores one non-stacked field as
+        # ``[sample_0, sample_1, ...]`` inside an outer micro-batch list.
+        # Unwrap that container before converting individual samples.
+        if isinstance(value, (list, tuple)) and len(value) == 1 and \
+                isinstance(value[0], (list, tuple)):
+            value = value[0]
+
+        def _convert(item):
+            if hasattr(item, 'data') and not isinstance(item, torch.Tensor):
+                item = item.data
+            if isinstance(item, torch.Tensor):
+                tensor = item.to(device=device, dtype=dtype)
+            else:
+                tensor = torch.as_tensor(
+                    np.asarray(item), device=device, dtype=dtype)
+            # A single-sample DataContainer may retain a leading singleton
+            # dimension.  Remove only those dimensions, never actor rows.
+            while tensor.ndim > 2 and tensor.shape[0] == 1:
+                tensor = tensor.squeeze(0)
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            return tensor
+
+        if isinstance(value, torch.Tensor):
+            tensor = value.to(device=device, dtype=dtype)
+            if tensor.ndim <= 2:
+                return [_convert(tensor)]
+            return [_convert(tensor[index]) for index in range(tensor.shape[0])]
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return []
+            # A raw unbatched list of actor rows is one sample; a collated
+            # ragged batch is a list whose elements are matrices.
+            def _ndim(item):
+                if isinstance(item, torch.Tensor):
+                    return item.ndim
+                return np.asarray(item, dtype=object).ndim
+            if all(_ndim(item) <= 1 for item in value):
+                return [_convert(value)]
+            return [_convert(item) for item in value]
+        return [_convert(value)]
 
     def _get_ego_feat(self, kwargs, batch_size, device, dtype):
         ego_states_all = kwargs['temporal_ego_states']
@@ -532,22 +596,24 @@ class SparseWorld4DTraj(OPUS):
             return None
         device = gt_relative_matrices.device if isinstance(
             gt_relative_matrices, torch.Tensor) else \
-            (boxes.device if isinstance(boxes, torch.Tensor) else torch.device('cpu'))
+            (boxes.device if isinstance(boxes, torch.Tensor) else
+             torch.device('cpu'))
         dtype = boxes.dtype if isinstance(boxes, torch.Tensor) else torch.float32
-        boxes = self._to_batch_tensor(boxes, device, dtype)
-        if boxes.ndim == 2:
-            boxes = boxes.unsqueeze(0)
-        batch_size, num_agents = boxes.shape[:2]
-        if feats is not None:
-            feats = self._to_batch_tensor(feats, device, dtype)
-            if feats.ndim == 2:
-                feats = feats.unsqueeze(0)
+        boxes = self._to_batch_sequence(boxes, device, dtype)
+        feats = self._to_batch_sequence(feats, device, dtype) \
+            if feats is not None else None
+        if not boxes:
+            return []
+        batch_size = len(boxes)
         metadata = []
         tau = float(self.dsqe_cfg.get('role_speed_threshold', 0.5))
         temperature = float(self.dsqe_cfg.get('role_speed_temperature', 0.5))
         dt = float(self.dsqe_cfg.get('role_frame_dt', 0.5))
         for batch_index in range(batch_size):
             current = boxes[batch_index]
+            if current.ndim == 1:
+                current = current.unsqueeze(0)
+            num_agents = current.shape[0]
             centers = current[:, :3]
             if current.shape[-1] >= 9:
                 velocity = current[:, 7:9]
@@ -556,26 +622,46 @@ class SparseWorld4DTraj(OPUS):
             future_centers = centers.clone()
             future_valid = torch.ones(num_agents, dtype=torch.bool,
                                        device=centers.device)
+            attribute_valid = future_valid.clone()
             trajectory_available = False
             trajectory_speed = None
-            if feats is not None and batch_index < feats.shape[0]:
+            if feats is not None and batch_index < len(feats):
                 agent_feat = feats[batch_index]
+                if agent_feat.ndim == 1:
+                    agent_feat = agent_feat.unsqueeze(0)
+                # Keep the actor/attribute pairing well-defined even if an
+                # upstream sample contains a malformed trailing row.
+                num_attr_agents = min(num_agents, agent_feat.shape[0])
+                if num_attr_agents != num_agents:
+                    padded = centers.new_zeros(
+                        num_agents, agent_feat.shape[-1])
+                    padded[:num_attr_agents] = agent_feat[:num_attr_agents]
+                    agent_feat = padded
+                    attribute_valid[num_attr_agents:] = False
                 trajectory_dims = 2 * self.num_fu_frames
                 if agent_feat.shape[-1] >= trajectory_dims:
                     trajectory_available = True
                     trajectories = agent_feat[:, :trajectory_dims].reshape(
                         num_agents, self.num_fu_frames, 2)
                     step = max(0, min(interval - 1, self.num_fu_frames - 1))
-                    displacement = trajectories[:, step]
-                    trajectory_speed = displacement.norm(dim=-1) / max(
+                    step_displacement = trajectories[:, step]
+                    cumulative_displacement = trajectories[:, :step + 1].sum(
+                        dim=1)
+                    trajectory_speed = step_displacement.norm(dim=-1) / max(
                         dt, 1e-3)
                     # Interval zero is matched against current-frame
                     # occupancy, so its actor centers must remain current.
                     if interval > 0:
-                        future_centers[:, :2] = centers[:, :2] + displacement
+                        # VAD-style future trajectories are adjacent-frame
+                        # increments.  Future actor centers therefore use
+                        # the cumulative displacement through this interval,
+                        # not only the final segment.
+                        future_centers[:, :2] = centers[:, :2] + \
+                            cumulative_displacement
                     mask_start = trajectory_dims
                     if agent_feat.shape[-1] >= mask_start + self.num_fu_frames:
                         future_valid = agent_feat[:, mask_start + step] > 0.5
+            future_valid = future_valid & attribute_valid
 
             compensated_current = centers
             if gt_relative_matrices is not None and interval > 0 and \
@@ -596,7 +682,8 @@ class SparseWorld4DTraj(OPUS):
                     future_transform)[0]
 
             displacement = future_centers[:, :2] - compensated_current[:, :2]
-            speed = displacement.norm(dim=-1) / max(dt * max(interval, 1), 1e-3)
+            speed = displacement.norm(dim=-1) / max(
+                dt * max(interval, 1), 1e-3)
             if interval == 0 and trajectory_speed is not None:
                 # Keep current-frame matching at the current center while
                 # still assigning the actor's observed motion state.
@@ -614,9 +701,23 @@ class SparseWorld4DTraj(OPUS):
                     dim=-1).sqrt()
             else:
                 radius = centers.new_full((num_agents,), 1.0)
+            actor_dims = current[:, 3:6].abs() \
+                if current.shape[-1] >= 6 else None
+            actor_yaw = current[:, 6] \
+                if current.shape[-1] >= 7 else None
+            if actor_yaw is not None and gt_relative_matrices is not None and \
+                    interval > 0 and interval - 1 < gt_relative_matrices.shape[1]:
+                # Rotate the actor footprint with the same current->future
+                # transform used for its center.
+                future_yaw = torch.atan2(
+                    future_transform[:, 1, 0],
+                    future_transform[:, 0, 0])[0]
+                actor_yaw = actor_yaw + future_yaw
             metadata.append(dict(
                 centers=future_centers,
                 radius=radius.clamp_min(0.5),
+                dims=actor_dims,
+                yaw=actor_yaw,
                 role=role,
                 valid=future_valid))
         return metadata
