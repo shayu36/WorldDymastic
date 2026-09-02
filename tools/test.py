@@ -75,6 +75,11 @@ def parse_args():
         default=1,
         )
     parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=0,
+        help='Evaluate only the first N validation samples; 0 means all.')
+    parser.add_argument(
         '--dump_dir', help='directory where results will be saved')
     parser.add_argument(
         '--gpu-collect',
@@ -206,6 +211,10 @@ def main():
     cfg.data.test.load_interval=args.load_interval  # debug用
     
     dataset = build_dataset(cfg.data.test)
+    if args.max_samples > 0 and hasattr(dataset, 'temp2nusc_map'):
+        # Truncate before constructing the distributed sampler so all ranks
+        # evaluate the same deterministic first-N subset.
+        dataset.temp2nusc_map = dataset.temp2nusc_map[:args.max_samples]
     data_loader = build_dataloader(dataset, **test_loader_cfg)
     
     

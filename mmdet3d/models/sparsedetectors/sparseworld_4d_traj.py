@@ -424,8 +424,14 @@ class SparseWorld4DTraj(OPUS):
             relative_matrix, lidar_delta
 
     def _select_geometry_pose(self, predicted, target):
-        if target is None or not self.training or \
-                self.ego_teacher_forcing_ratio <= 0:
+        if target is None:
+            return predicted
+        # Explicit evaluation-only oracle for the pose diagnostic.  Normal
+        # validation keeps using the predicted pose.
+        if (not self.training and
+                self.dsqe_cfg.get('eval_oracle_pose', False)):
+            return target
+        if not self.training or self.ego_teacher_forcing_ratio <= 0:
             return predicted
         batch_size = predicted.shape[0]
         use_target = torch.rand(
@@ -433,8 +439,10 @@ class SparseWorld4DTraj(OPUS):
             self.ego_teacher_forcing_ratio
         return torch.where(use_target[:, None, None], target, predicted)
 
-    def _build_role_teacher(self, previous_match, num_new, reference):
-        if previous_match is None or self.role_teacher_forcing_ratio <= 0:
+    def _build_role_teacher(self, previous_match, num_new, reference,
+                            force=False):
+        teacher_ratio = 1.0 if force else self.role_teacher_forcing_ratio
+        if previous_match is None or teacher_ratio <= 0:
             return None, None
         teacher = previous_match['role_target'].unsqueeze(-1)
         valid = previous_match['role_valid'].unsqueeze(-1)
@@ -452,6 +460,12 @@ class SparseWorld4DTraj(OPUS):
 
     def _refine_semantics(self, base_semantics, next_feat):
         batch_size = next_feat.shape[0]
+        if (not self.training and
+                self.dsqe_cfg.get('eval_legacy_semantics', False)):
+            # Keep DSQE point evolution fixed while replacing only the
+            # semantic output with the legacy per-step cls branch.
+            return self.cls_branch(next_feat).reshape(
+                batch_size, -1, self.num_refines, 17), None
         correction = self.semantic_correction_head(next_feat).reshape(
             batch_size, -1, self.num_refines, 17)
         semantics = base_semantics + self.dsqe_cfg[
@@ -478,8 +492,10 @@ class SparseWorld4DTraj(OPUS):
             img_metas, kwargs, state_feat.device, state_feat.dtype)
         lidar_to_ego = self._get_lidar_to_ego(
             img_metas, state_feat.device, state_feat.dtype)
+        oracle_role = (not self.training and
+                       self.dsqe_cfg.get('eval_oracle_role', False))
         future_voxels = self._get_future_voxels(kwargs) \
-            if self.training else None
+            if (self.training or oracle_role) else None
         geometry_cumulative = self.ego_warp.identity(
             batch_size, state_feat.device, state_feat.dtype)
 
@@ -490,6 +506,17 @@ class SparseWorld4DTraj(OPUS):
         dsqe_outputs = []
         match_cache_list = []
         previous_match = None
+
+        # Seed the first oracle-role step with labels matched against the
+        # current-frame occupancy.  Later steps use the cache from the
+        # preceding forecast.  New slots remain invalid in the teacher mask
+        # and therefore continue to use their semantic prior.
+        if oracle_role:
+            current_voxel = kwargs.get('voxel_semantics')
+            if current_voxel is not None:
+                previous_match = \
+                    self.pts_bbox_head.build_future_match_cache(
+                        state_points, current_voxel)
 
         if self.training:
             num_fu_frames = max(
@@ -548,14 +575,15 @@ class SparseWorld4DTraj(OPUS):
                 ], dim=1)
 
             teacher_role, teacher_valid = self._build_role_teacher(
-                previous_match, num_new, route_points)
+                previous_match, num_new, route_points, force=oracle_role)
             role_output = self.role_router(
                 conditioned_feat, route_points, base_semantics, source_flag,
                 role_prior=role_prior,
                 role_prior_valid=role_prior_valid,
                 teacher_role=teacher_role,
                 teacher_valid=teacher_valid,
-                teacher_forcing_ratio=self.role_teacher_forcing_ratio)
+                teacher_forcing_ratio=(1.0 if oracle_role else
+                                       self.role_teacher_forcing_ratio))
             query_role = role_output['query_role']
 
             ego_next, pred_traj, predicted_pose, predicted_relative, \

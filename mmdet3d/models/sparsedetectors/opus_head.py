@@ -187,14 +187,15 @@ class OPUSHead(BaseModule):
 
         # cls assignment
         refine_pts_labels = gt_labels[pred_paired_idx]
-        cls_weights = self.train_cfg.get('cls_weights', [1] * self.num_classes)
+        train_cfg = self.train_cfg or {}
+        cls_weights = train_cfg.get('cls_weights', [1] * self.num_classes)
         cls_weights = refine_pts.new_tensor(cls_weights)
         label_weights = cls_weights * \
                         self.get_dis_weight(pred_paired_pts)[..., None]
 
         # gt side assignment
-        empty_dist_thr = self.train_cfg.get('empty_dist_thr', 0.2)
-        empty_weights = self.train_cfg.get('empty_weights', 3)
+        empty_dist_thr = train_cfg.get('empty_dist_thr', 0.2)
+        empty_weights = train_cfg.get('empty_weights', 3)
 
         gt_pts_weights = refine_pts.new_ones(gt_paired_pts.shape[0])
         dist = torch.norm(gt_points - gt_paired_pts, dim=-1)

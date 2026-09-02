@@ -252,9 +252,11 @@ test_pipeline = [
                 with_label=False),
             dict(type='Collect4D', keys=['img', 'voxel_semantics',
                                         'mask_lidar','mask_camera','temporal_semantics',
-                                        'temporal_ego_states', 'temporal_trajs', 'temporal_agent_boxes', 'temporal_agent_feats',],
+                                        'temporal_ego_states', 'temporal_ego2global',
+                                        'temporal_trajs', 'temporal_agent_boxes', 'temporal_agent_feats',],
                  meta_keys = ['filename','box_type_3d','ori_shape','img_shape','pad_shape','sample_idx',
-                              'lidar2img','img_timestamp','ego2lidar','gt_boxes','gt_labels','occ_gt_path'])
+                              'lidar2img','img_timestamp','ego2lidar','ego2global',
+                              'gt_boxes','gt_labels','occ_gt_path'])
         ])
 ]
 
