@@ -9,6 +9,7 @@
 - [实验结果](03_experiment_results.md)：BaseLine 与 DSQE epoch 21/25/30/32 的完整结果和差值表。
 - [分析与建议](04_analysis_and_recommendations.md)：结果解读、checkpoint 选择建议和后续复核项。
 - [Oracle 诊断实验](05_oracle_diagnostics.md)：B0/B1/C1/D1 的 500 样本对照结果、逐类别 IoU、规划指标和诊断结论。
+- [DSQE 残差建模修正](06_dsqe_residual_modeling_repair.md)：BaseLine carrier、DSQE 残差路径、运动状态角色 GT、TASS 固定同步和 Stage 1 冻结边界。
 - [语义结果 CSV](results_summary.csv)：只保留 1s/2s/3s 的语义占用结果。
 - [规划结果 CSV](planning_results.csv)：只保留 1s/2s/3s 的 L2 和碰撞率结果。
 

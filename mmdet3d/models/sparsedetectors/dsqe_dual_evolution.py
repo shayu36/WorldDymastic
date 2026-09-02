@@ -84,7 +84,15 @@ class DSQEDualEvolution(nn.Module):
                 next_to_current,
                 next_to_t0,
                 ego_warp,
-                legacy_dynamic_xy=None):
+                base_points=None):
+        """Predict a single residual update relative to a BaseLine carrier.
+
+        With ``base_points`` supplied, the BaseLine already contains its
+        original ``reg_branch``/``vel_branch`` update.  DSQE therefore emits
+        only one point-level dynamic/static residual and never adds another
+        complete velocity update.  The prior-only path remains available for
+        backwards-compatible module tests and old callers.
+        """
         num_carried = carried_points.shape[1]
         carried_feat = query_feat[:, :num_carried]
         new_feat = query_feat[:, num_carried:]
@@ -104,26 +112,56 @@ class DSQEDualEvolution(nn.Module):
             ], dim=-1)
             query_motion = self.motion_head(motion_input).tanh()
             query_motion = query_motion * self.motion_scale
+        else:
+            query_motion = carried_prior_metric.new_zeros(
+                carried_prior_metric.shape[:2] + (3,))
 
+        if base_points is not None:
+            base_metric = decode_points(base_points, self.pc_range)
+            dynamic_residual = self._point_residual(
+                self.dynamic_residual_head, query_feat,
+                self.dynamic_residual_scale).clone()
+            # The first residual stage is planar for dynamic actors.
+            dynamic_residual[..., 2] = 0
+            static_residual = self._point_residual(
+                self.static_residual_head, query_feat,
+                self.dynamic_residual_scale) * self.static_alpha
+            point_role = point_role.to(dtype=base_metric.dtype)
+            residual_delta = point_role * dynamic_residual + \
+                (1 - point_role) * static_residual
+            evolved_metric = base_metric + residual_delta
+            return dict(
+                points=encode_points(evolved_metric, self.pc_range),
+                points_metric=evolved_metric,
+                base_points_metric=base_metric,
+                carried_prior=carried_prior,
+                carried_prior_metric=carried_prior_metric,
+                new_prior=new_prior,
+                new_prior_metric=new_prior_metric,
+                static_points_metric=base_metric + static_residual,
+                dynamic_points_metric=base_metric + dynamic_residual,
+                query_motion=query_motion,
+                static_residual=static_residual,
+                dynamic_residual=dynamic_residual,
+                new_residual=residual_delta,
+                residual_delta=residual_delta,
+            )
+
+        if num_carried > 0:
             static_residual = self._point_residual(
                 self.static_residual_head, carried_feat,
                 self.dynamic_residual_scale)
             dynamic_residual = self._point_residual(
                 self.dynamic_residual_head, carried_feat,
                 self.dynamic_residual_scale)
-            if legacy_dynamic_xy is not None:
-                legacy_xy = legacy_dynamic_xy[:, :num_carried].tanh()
-                legacy_xy = legacy_xy * self.dynamic_residual_scale
-                dynamic_residual = dynamic_residual.clone()
-                dynamic_residual[..., :2] += legacy_xy
-
+            dynamic_residual = dynamic_residual.clone()
+            dynamic_residual[..., 2] = 0
             static_points = carried_prior_metric + \
                 self.static_alpha * static_residual
-            dynamic_points = carried_prior_metric + \
-                query_motion.unsqueeze(2) + dynamic_residual
-            point_gate = self.beta * query_role[:, :num_carried].unsqueeze(2)
-            point_gate = point_gate + (1 - self.beta) * \
-                point_role[:, :num_carried]
+            # Even the compatibility path uses point-level roles directly;
+            # the former fixed query-level beta gate is intentionally gone.
+            dynamic_points = carried_prior_metric + dynamic_residual
+            point_gate = point_role[:, :num_carried].clamp(0, 1)
             carried_evolved = (1 - point_gate) * static_points + \
                 point_gate * dynamic_points
         else:

@@ -125,6 +125,12 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
         assert gradients, prefix
         assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
+    # Stage-1 must not backpropagate into the frozen BaseLine carrier.
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            assert parameter.grad is None or torch.allclose(
+                parameter.grad, torch.zeros_like(parameter.grad)), name
+
 
 if __name__ == '__main__':
     test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss()

@@ -189,6 +189,7 @@ train_pipeline = [
         type='Collect4D', keys=['img', 'voxel_semantics',
                                 'mask_lidar','mask_camera',
                                  'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_ego2global',
+                                 'temporal_agent_boxes', 'temporal_agent_feats',
                                ],meta_keys = ('filename','ori_shape','img_shape','pad_shape','lidar2img','img_timestamp','ego2lidar','ego2global','sample_idx',))
 ]
 

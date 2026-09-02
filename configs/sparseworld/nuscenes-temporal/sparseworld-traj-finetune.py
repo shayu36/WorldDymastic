@@ -130,8 +130,6 @@ model = dict(
         motion_scale=4.0,
         dynamic_residual_scale=1.0,
         new_residual_scale=2.0,
-        point_correction_scale=0.5,
-        correction_static_scale=0.2,
         semantic_residual_scale=0.5,
         role_correction_scale=0.25,
         dynamic_from_static_init=1.0,
@@ -141,6 +139,16 @@ model = dict(
         ego_teacher_forcing=1.0,
         teacher_forcing_start_epoch=finetune_epoch,
         teacher_forcing_end_epoch=finetune_epoch + 12,
+        dsqe_training_stage='residual_stage1',
+        freeze_baseline=True,
+        freeze_tass=True,
+        planning_gradient_to_dsqe=False,
+        feature_residual_scale=1.0,
+        dynamic_point_delta_scale=1.0,
+        static_point_delta_scale=0.2,
+        role_speed_threshold=0.5,
+        role_speed_temperature=0.5,
+        role_frame_dt=0.5,
         role_gamma=2.0,
         role_alpha=0.75,
         role_query_weight=0.5,
@@ -232,6 +240,7 @@ train_pipeline = [
         type='Collect4D', keys=['img', 'voxel_semantics',
                                 'mask_lidar','mask_camera',
                                  'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_ego2global',
+                                'temporal_agent_boxes', 'temporal_agent_feats',
                                ],meta_keys = ('filename','ori_shape','img_shape','pad_shape','lidar2img','img_timestamp','ego2lidar','ego2global','sample_idx',))
 ]
 
