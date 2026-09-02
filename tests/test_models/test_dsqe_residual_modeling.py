@@ -1,5 +1,6 @@
 from types import MethodType, SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 from mmcv.parallel import collate
@@ -230,7 +231,9 @@ def test_dynamic_loss_soft_dead_zone_has_role_gradient():
         'gt_labels_list': [torch.tensor([4])],
         'labels_list': [torch.tensor([0, 0])],
         'gt_paired_idx_list': [torch.tensor([0, 0])],
-        'pred_paired_idx_list': [torch.tensor([0])],
+        # Keep the cached prediction->GT assignment cardinality identical to
+        # the two predicted points, as it is in a real future cache.
+        'pred_paired_idx_list': [torch.tensor([0, 0])],
         'label_weights_list': [torch.ones(2, 17)],
         'role_target': torch.ones(1, 1, 2),
         'role_valid': torch.ones(1, 1, 2, dtype=torch.bool),
@@ -318,6 +321,48 @@ def test_tass_assignment_is_fixed_across_epochs():
     torch.testing.assert_close(first, model.pts_bbox_head.ind_stamps_all)
     counts = torch.bincount(first.long(), minlength=7).tolist()
     assert counts == [2, 1, 1, 1, 1, 1, 1]
+
+
+def test_tass_sync_fails_loudly_on_rank_divergence(monkeypatch):
+    expected_num = torch.ones(8, 7, dtype=torch.long)
+    expected_ind = torch.tensor([0, 0, 1, 2, 3, 4, 5, 6])
+
+    class _Head:
+        num_stamps_all = expected_num.clone()
+        ind_stamps_all = expected_ind.clone()
+
+        @staticmethod
+        def reset_mask():
+            return None
+
+    model = SimpleNamespace(pts_bbox_head=_Head())
+
+    class _FakeDistributed:
+        @staticmethod
+        def is_available():
+            return True
+
+        @staticmethod
+        def is_initialized():
+            return True
+
+        @staticmethod
+        def get_rank():
+            return 1
+
+        @staticmethod
+        def broadcast(tensor, src=0):
+            if tensor.shape == expected_num.shape:
+                tensor.copy_(expected_num)
+            else:
+                tensor.copy_(expected_ind)
+
+    # Keep num_stamps equal but make the local time-slot assignment diverge.
+    _Head.ind_stamps_all = expected_ind.clone()
+    _Head.ind_stamps_all[2] = 0
+    monkeypatch.setattr(torch, 'distributed', _FakeDistributed)
+    with pytest.raises(RuntimeError, match='ind_stamps_all mismatch'):
+        SparseWorld4DTraj._synchronize_tass_state(model)
 
 
 def test_old_checkpoint_missing_new_residual_head_is_compatible():

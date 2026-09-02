@@ -3,6 +3,8 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
+from mmcv import Config
+from mmdet3d.models import build_model
 
 from mmdet3d.models.sparsedetectors.bbox.utils import (
     decode_points, encode_points)
@@ -166,3 +168,26 @@ def test_dsqe_off_matches_official_baseline_outputs_and_loss():
             torch.testing.assert_close(actual_value, expected_value)
     torch.testing.assert_close(
         _derived_future_loss(actual), _derived_future_loss(expected))
+
+
+def test_real_model_accepts_baseline_state_without_dsqe_parameters():
+    cfg = Config.fromfile(
+        'configs/sparseworld/nuscenes-temporal/'
+        'sparseworld-traj-finetune.py')
+    model = build_model(
+        cfg.model, train_cfg=cfg.get('train_cfg'),
+        test_cfg=cfg.get('test_cfg'))
+    dsqe_prefixes = (
+        'role_router.', 'dual_evolution.', 'dual_interaction.',
+        'joint_refine.', 'semantic_correction_head.',
+        'feature_residual_head.', 'ego_cross_attn_static.',
+        'ego_dynamic_proj.', 'ego_static_proj.', 'ego_fusion_norm.',
+        'source_embedding.', 'activation_embedding.', 'yaw_head.')
+    baseline_state = {
+        key: value for key, value in model.state_dict().items()
+        if not key.startswith(dsqe_prefixes)
+    }
+    incompatible = model.load_state_dict(baseline_state, strict=False)
+    assert not incompatible.unexpected_keys
+    assert any(key.startswith('role_router.')
+               for key in incompatible.missing_keys)

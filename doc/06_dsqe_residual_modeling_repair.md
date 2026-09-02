@@ -109,7 +109,7 @@ DSQE Stage 1 不再在 `set_epoch()` 中执行 `num_stamps_all[:] = 1`，也不�
 /data/jxy/projects/env/bin/python -m pytest -q tests/test_models
 ```
 
-结果：`33 passed`。新增测试覆盖相邻帧 actor 位移累计、旋转 box footprint、ragged actor batch=2 的 mmcv collate、GT→预测覆盖，以及此前已有的 BaseLine 残差恒等性、零初始化梯度、逐时刻语义独立性、运动状态角色匹配、混合 Query 点级路由、动态损失软死区、重复位移防止、TASS 固定和旧 state dict 兼容；同时通过已有 DSQE 两步 CUDA smoke test。
+结果：`35 passed`。新增测试覆盖相邻帧 actor 位移累计、旋转 box footprint、ragged actor batch=2 的 mmcv collate、GT→预测覆盖、TASS rank divergence 检测和真实模型的 Baseline-only state dict 兼容；同时通过已有 DSQE 两步 CUDA smoke test（已传入 moving/stationary actor 字段），以及此前已有的 BaseLine 残差恒等性、零初始化梯度、逐时刻语义独立性、运动状态角色匹配、混合 Query 点级路由、动态损失软死区和重复位移防止测试。
 
 另外已执行相关文件 `py_compile` 检查通过。尚未执行完整训练、4219 样本验证、真实多进程 rank divergence 注入测试和需要完整 nuScenes 数据的端到端指标验证。
 

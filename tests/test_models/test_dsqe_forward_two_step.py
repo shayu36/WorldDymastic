@@ -75,6 +75,19 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
     voxel_semantics = _sparse_semantics(batch_size, 0).cuda()
     mask_lidar = torch.ones_like(voxel_semantics, dtype=torch.bool)
     mask_camera = torch.ones_like(voxel_semantics, dtype=torch.bool)
+    # Exercise the real motion-state role path instead of relying only on
+    # semantic occupancy targets.  The two actors intentionally have
+    # different states: one moving and one stationary.
+    temporal_agent_boxes = torch.tensor(
+        [[[0.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0, 0.0, 0.0],
+          [5.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.0, 0.0, 0.0]]],
+        device='cuda')
+    temporal_agent_feats = torch.zeros(
+        batch_size, 2, 2 * cfg.num_fu_frames + cfg.num_fu_frames,
+        device='cuda')
+    temporal_agent_feats[:, 0, 0::2] = 0.5
+    temporal_agent_feats[:, 0, 2:2 * cfg.num_fu_frames:2] = 0.5
+    temporal_agent_feats[:, :, 2 * cfg.num_fu_frames:] = 1.0
 
     losses = model(
         return_loss=True,
@@ -87,6 +100,8 @@ def test_two_step_dsqe_forward_with_role_correction_and_dynamic_loss():
         temporal_trajs=temporal_trajs,
         temporal_ego2global=temporal_ego2global,
         temporal2ego=temporal2ego,
+        temporal_agent_boxes=temporal_agent_boxes,
+        temporal_agent_feats=temporal_agent_feats,
         temporal_semantics=temporal_semantics)
 
     assert 'loss_total' not in losses
