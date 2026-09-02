@@ -147,7 +147,9 @@ model = dict(
         dynamic_point_delta_scale=1.0,
         static_point_delta_scale=0.2,
         role_speed_threshold=0.5,
-        role_speed_temperature=0.5,
+        # A sharp but differentiable speed-to-role mapping keeps stationary
+        # actors near zero while preserving high roles for moving actors.
+        role_speed_temperature=0.1,
         role_frame_dt=0.5,
         role_gamma=2.0,
         role_alpha=0.75,

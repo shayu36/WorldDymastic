@@ -607,7 +607,7 @@ class SparseWorld4DTraj(OPUS):
         batch_size = len(boxes)
         metadata = []
         tau = float(self.dsqe_cfg.get('role_speed_threshold', 0.5))
-        temperature = float(self.dsqe_cfg.get('role_speed_temperature', 0.5))
+        temperature = float(self.dsqe_cfg.get('role_speed_temperature', 0.1))
         dt = float(self.dsqe_cfg.get('role_frame_dt', 0.5))
         for batch_index in range(batch_size):
             current = boxes[batch_index]
@@ -625,6 +625,7 @@ class SparseWorld4DTraj(OPUS):
             attribute_valid = future_valid.clone()
             trajectory_available = False
             trajectory_speed = None
+            future_yaw_delta = None
             if feats is not None and batch_index < len(feats):
                 agent_feat = feats[batch_index]
                 if agent_feat.ndim == 1:
@@ -661,6 +662,14 @@ class SparseWorld4DTraj(OPUS):
                     mask_start = trajectory_dims
                     if agent_feat.shape[-1] >= mask_start + self.num_fu_frames:
                         future_valid = agent_feat[:, mask_start + step] > 0.5
+                    # VAD stores future yaw as adjacent-frame yaw deltas at
+                    # the end of the attribute vector, just like the future
+                    # xy trajectories.  Keep the full vector so the yaw can
+                    # be accumulated through the selected interval.
+                    yaw_start = agent_feat.shape[-1] - self.num_fu_frames
+                    if yaw_start >= mask_start + self.num_fu_frames + 1:
+                        future_yaw_delta = agent_feat[
+                            :, yaw_start:yaw_start + self.num_fu_frames]
             future_valid = future_valid & attribute_valid
 
             compensated_current = centers
@@ -684,9 +693,10 @@ class SparseWorld4DTraj(OPUS):
             displacement = future_centers[:, :2] - compensated_current[:, :2]
             speed = displacement.norm(dim=-1) / max(
                 dt * max(interval, 1), 1e-3)
-            if interval == 0 and trajectory_speed is not None:
-                # Keep current-frame matching at the current center while
-                # still assigning the actor's observed motion state.
+            if trajectory_speed is not None:
+                # Position matching uses cumulative displacement, whereas
+                # the role at this forecast step represents the actor's
+                # instantaneous adjacent-frame motion state.
                 speed = trajectory_speed
             # If no future attribute is available, current velocity is the
             # explicit fallback; it is still a motion-state estimate, not a
@@ -705,6 +715,11 @@ class SparseWorld4DTraj(OPUS):
                 if current.shape[-1] >= 6 else None
             actor_yaw = current[:, 6] \
                 if current.shape[-1] >= 7 else None
+            if actor_yaw is not None and future_yaw_delta is not None and \
+                    interval > 0:
+                yaw_step = min(interval - 1, future_yaw_delta.shape[1] - 1)
+                actor_yaw = actor_yaw + future_yaw_delta[:, :yaw_step + 1].sum(
+                    dim=1)
             if actor_yaw is not None and gt_relative_matrices is not None and \
                     interval > 0 and interval - 1 < gt_relative_matrices.shape[1]:
                 # Rotate the actor footprint with the same current->future

@@ -716,9 +716,11 @@ class OPUSHead(BaseModule):
             # Keep a non-zero floor for low-confidence roles and normalize by
             # GT role mass rather than the same prediction-dependent weight.
             # This preserves a useful geometric gradient even when every
-            # predicted role is below 0.5.
-            dynamic_weight = role_target * (
-                0.25 + 0.75 * pred_role) * \
+            # predicted role is below 0.5.  ``detach`` is intentional: the
+            # geometry term must not lower the role probability merely to
+            # reduce its own weight; role BCE supervision owns that gradient.
+            geometry_weight = 0.25 + 0.75 * pred_role.detach()
+            dynamic_weight = role_target * geometry_weight * \
                 role_valid.to(pred_role.dtype)
             dynamic_weight = dynamic_weight[:pred_error.shape[0]]
             pred_distance_sum = pred_distance_sum + \
@@ -754,7 +756,7 @@ class OPUSHead(BaseModule):
                     gt_error = (dynamic_gt_points -
                                 pred_points[nearest_pred]).abs().mean(dim=-1)
                     gt_weight = dynamic_gt_role * (
-                        0.25 + 0.75 * pred_role[nearest_pred])
+                        0.25 + 0.75 * pred_role[nearest_pred].detach())
                     gt_distance_sum = gt_distance_sum + \
                         (gt_weight * gt_error).sum()
                     gt_count = gt_count + dynamic_gt_role.sum()

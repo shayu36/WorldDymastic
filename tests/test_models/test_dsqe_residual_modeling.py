@@ -126,9 +126,42 @@ def test_role_metadata_accumulates_adjacent_future_displacements():
     assert len(metadata) == 1
     torch.testing.assert_close(
         metadata[0]['centers'][0, :2], torch.tensor([0.75, 0.0]))
-    expected_role = torch.sigmoid(torch.tensor((0.75 - 0.5) / 0.5))
+    expected_role = torch.sigmoid(torch.tensor((0.25 / 0.5 - 0.5) / 0.5))
     torch.testing.assert_close(metadata[0]['role'][0], expected_role)
     assert metadata[0]['yaw'].shape == (1,)
+
+
+def test_role_metadata_uses_current_segment_speed_and_future_yaw():
+    model = SimpleNamespace(
+        num_fu_frames=2,
+        dsqe_cfg={
+            'role_speed_threshold': 0.5,
+            'role_speed_temperature': 0.1,
+            'role_frame_dt': 0.5,
+        },
+        ego_warp=DSQEEgoWarp(PC_RANGE))
+    model._to_batch_sequence = SparseWorld4DTraj._to_batch_sequence
+    boxes = torch.tensor([[
+        0.0, 0.0, 0.0, 4.0, 2.0, 2.0, 0.1, 0.0, 0.0
+    ]])
+    # Layout: 4 trajectory values, 2 masks, goal, 9-D LCF feature, 2 yaw
+    # deltas.  The actor moves in the first segment and stops in the second.
+    feats = torch.tensor([[
+        0.5, 0.0, 0.0, 0.0,
+        1.0, 1.0, 9.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.2, 0.3,
+    ]])
+    gt_relative = torch.eye(4).reshape(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    metadata = SparseWorld4DTraj._build_role_metadata(
+        model, {'temporal_agent_boxes': boxes,
+                'temporal_agent_feats': feats}, 2, gt_relative)
+    # Position uses 0.5 m cumulative displacement; role uses only the
+    # current (zero) segment and must therefore be near zero.
+    torch.testing.assert_close(
+        metadata[0]['centers'][0, :2], torch.tensor([0.5, 0.0]))
+    assert metadata[0]['role'][0] < 0.01
+    torch.testing.assert_close(metadata[0]['yaw'][0], torch.tensor(0.6))
 
 
 def test_role_metadata_accepts_ragged_actor_batch():
@@ -224,7 +257,8 @@ def test_dynamic_loss_soft_dead_zone_has_role_gradient():
     head.num_classes = 17
     head.loss_cls = _Loss()
     role_pred = torch.full((1, 1, 2, 1), 0.2, requires_grad=True)
-    refine = torch.tensor([[[0., 0., 0.], [2., 0., 0.]]])
+    refine = torch.tensor(
+        [[[0., 0., 0.], [2., 0., 0.]]], requires_grad=True)
     cache = {
         'valid_gt_list': [True],
         'gt_points_list': [torch.tensor([[1., 0., 0.]])],
@@ -245,8 +279,13 @@ def test_dynamic_loss_soft_dead_zone_has_role_gradient():
         head, torch.zeros(1, 1, 2, 17), output, cache, refine)
     assert loss > 0
     loss.backward()
-    assert role_pred.grad is not None
-    assert role_pred.grad.abs().sum() > 0
+    # Geometry weights are detached from the role branch.  The position
+    # residual still receives a non-zero gradient, while role BCE remains the
+    # sole owner of the role probability direction.
+    assert role_pred.grad is None or torch.allclose(
+        role_pred.grad, torch.zeros_like(role_pred.grad))
+    assert refine.grad is not None
+    assert refine.grad.abs().sum() > 0
 
 
 def test_dynamic_loss_penalizes_uncovered_gt_points():
