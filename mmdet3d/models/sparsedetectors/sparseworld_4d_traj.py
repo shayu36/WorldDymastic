@@ -718,7 +718,11 @@ class SparseWorld4DTraj(OPUS):
             if actor_yaw is not None and future_yaw_delta is not None and \
                     interval > 0:
                 yaw_step = min(interval - 1, future_yaw_delta.shape[1] - 1)
-                actor_yaw = actor_yaw + future_yaw_delta[:, :yaw_step + 1].sum(
+                # ``gt_boxes`` stores SECOND yaw (``-raw_yaw - pi/2``),
+                # while ``gt_agent_fut_yaw`` stores raw adjacent-frame yaw
+                # deltas.  Convert the raw delta into the SECOND convention
+                # by subtracting the accumulated delta.
+                actor_yaw = actor_yaw - future_yaw_delta[:, :yaw_step + 1].sum(
                     dim=1)
             if actor_yaw is not None and gt_relative_matrices is not None and \
                     interval > 0 and interval - 1 < gt_relative_matrices.shape[1]:

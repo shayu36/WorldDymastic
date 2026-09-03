@@ -51,7 +51,7 @@ v^{rel}=\frac{\|P_{t+1}^{GT}-Warp(P_t^{GT})\|}{\Delta t},\qquad
 r^{GT}=\sigma((v^{rel}-\tau)/T)
 \]
 
-数据中的未来轨迹按相邻帧增量解释：第 `k` 个未来框中心使用前 `k` 段位移的累计和，但该时刻角色速度只使用第 `k` 段瞬时位移除以 `dt`，不能用累计平均速度把“先运动、后停止”的 actor 继续标为动态。未来 yaw 同样按相邻帧 yaw 增量累计，并叠加统一自车变换的旋转。actor 中心先经过统一的 GT 自车变换补偿，再用于匹配。对于完整 box 字段，匹配使用带 yaw 的旋转矩形/长方体内部判断；缺少尺寸或朝向字段时才回退到兼容半径。无法匹配的动态点 `role_valid=False`。明确静态类点角色为 0 并保持有效。没有 actor 元数据时，动态类别不会伪造为有效动态 GT。
+数据中的未来轨迹按相邻帧增量解释：第 `k` 个未来框中心使用前 `k` 段位移的累计和，但该时刻角色速度只使用第 `k` 段瞬时位移除以 `dt`，不能用累计平均速度把“先运动、后停止”的 actor 继续标为动态。未来 yaw 同样按相邻帧 yaw 增量累计；由于 `gt_boxes` 使用 SECOND 约定而 `gt_agent_fut_yaw` 保存 raw yaw 增量，转换时需要从当前 SECOND yaw 中减去累计 raw yaw，再叠加统一自车变换的旋转。actor 中心先经过统一的 GT 自车变换补偿，再用于匹配。对于完整 box 字段，匹配使用带 yaw 的旋转矩形/长方体内部判断；缺少尺寸或朝向字段时才回退到兼容半径。无法匹配的动态点 `role_valid=False`。明确静态类点角色为 0 并保持有效。没有 actor 元数据时，动态类别不会伪造为有效动态 GT。
 
 `temporal_agent_boxes` 和 `temporal_agent_feats` 在格式化阶段使用
 `DataContainer(stack=False)`，模型侧通过 ragged per-sample sequence 消费，因此每卡

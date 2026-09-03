@@ -161,7 +161,10 @@ def test_role_metadata_uses_current_segment_speed_and_future_yaw():
     torch.testing.assert_close(
         metadata[0]['centers'][0, :2], torch.tensor([0.5, 0.0]))
     assert metadata[0]['role'][0] < 0.01
-    torch.testing.assert_close(metadata[0]['yaw'][0], torch.tensor(0.6))
+    # Current box yaw is in SECOND convention, whereas future yaw deltas are
+    # raw-angle deltas; the conversion therefore subtracts their cumulative
+    # value: 0.1 - 0.2 - 0.3 = -0.4.
+    torch.testing.assert_close(metadata[0]['yaw'][0], torch.tensor(-0.4))
 
 
 def test_role_metadata_accepts_ragged_actor_batch():
