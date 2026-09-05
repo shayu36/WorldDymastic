@@ -323,6 +323,28 @@ def test_dynamic_loss_penalizes_uncovered_gt_points():
     assert loss > 0
 
 
+def test_dsqe_diagnostic_keys_are_fixed_for_ddp():
+    left = {
+        'init_loss_pts': torch.tensor(1.0),
+        'fu1.loss_cls': torch.tensor(1.0),
+        'fu1.dynamic_displacement_error_x': torch.tensor(2.0),
+        'fu2.loss_cls': torch.tensor(3.0),
+    }
+    right = {
+        'init_loss_pts': torch.tensor(1.0),
+        'fu1.loss_cls': torch.tensor(1.0),
+        'fu2.loss_cls': torch.tensor(3.0),
+    }
+    OPUSHead._fill_missing_dsqe_diagnostics(
+        left, 2, left['init_loss_pts'] * 0)
+    OPUSHead._fill_missing_dsqe_diagnostics(
+        right, 2, right['init_loss_pts'] * 0)
+    assert list(left) == list(right)
+    assert 'fu1.dynamic_displacement_error_x' in left
+    assert 'fu1.static_warp_error_z' in left
+    assert all(torch.is_tensor(value) for value in left.values())
+
+
 def test_zero_point_residual_does_not_add_legacy_velocity():
     evolution = DSQEDualEvolution(
         embed_dims=8, num_points=2, pc_range=PC_RANGE)

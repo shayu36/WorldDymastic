@@ -21,6 +21,38 @@ colors = torch.tensor([
     [0.50, 0.00, 0.50],   # 紫 Purple
 ])
 
+# These diagnostics are emitted as scalar entries in the loss dictionary and
+# therefore must have the same key set on every DDP rank.  Some diagnostics
+# are legitimately unavailable for a local batch (for example, a rank may
+# contain no moving actor points), so ``loss_future`` fills the missing ones
+# with graph-connected zeros before returning.
+_DSQE_DIAGNOSTIC_NAMES = (
+    'role_accuracy', 'dynamic_ratio', 'dynamic_precision',
+    'dynamic_recall', 'dynamic_f1', 'gt_dynamic_ratio',
+    'pred_dynamic_ratio', 'mean_role_on_moving_gt',
+    'mean_role_on_static_gt', 'role_saturation_low',
+    'role_saturation_high', 'gate_dynamic_from_static',
+    'gate_static_from_dynamic',
+    'dynamic_delta_mean_x', 'dynamic_delta_mean_y',
+    'dynamic_delta_mean_z', 'dynamic_delta_abs_mean_x',
+    'dynamic_delta_abs_mean_y', 'dynamic_delta_abs_mean_z',
+    'dynamic_delta_p95_x', 'dynamic_delta_p95_y',
+    'dynamic_delta_p95_z', 'static_delta_mean_x',
+    'static_delta_mean_y', 'static_delta_mean_z',
+    'static_delta_abs_mean_x', 'static_delta_abs_mean_y',
+    'static_delta_abs_mean_z', 'static_delta_p95_x',
+    'static_delta_p95_y', 'static_delta_p95_z',
+    'query_motion_mean_x', 'query_motion_mean_y',
+    'query_motion_mean_z', 'query_motion_p95_x',
+    'query_motion_p95_y', 'query_motion_p95_z',
+    'static_warp_error_x', 'static_warp_error_y',
+    'static_warp_error_z', 'dynamic_displacement_error_x',
+    'dynamic_displacement_error_y', 'dynamic_displacement_error_z')
+
+_DSQE_FUTURE_LOSS_NAMES = (
+    'loss_cls', 'loss_pts', 'loss_role', 'loss_ego', 'loss_static',
+    'loss_dynamic', 'loss_smooth', 'loss_leak')
+
 
 @HEADS.register_module()
 class OPUSHead(BaseModule):
@@ -993,6 +1025,33 @@ class OPUSHead(BaseModule):
                     / denom
         return values
 
+    @staticmethod
+    def _fill_missing_dsqe_diagnostics(loss_dict, num_future, zero):
+        """Keep DDP ``log_vars`` identical when local diagnostics are absent.
+
+        Diagnostic values are intentionally detached by their producers, but
+        the fallback remains connected to the loss graph through ``zero`` so
+        this helper is also safe for callers that use the returned dictionary
+        to construct a scalar loss.
+        """
+        # ``BaseDetector._parse_losses`` reduces values in insertion order.
+        # Rebuild the dictionary in a canonical per-future-step order rather
+        # than merely appending missing keys; otherwise ranks with different
+        # diagnostics would silently all-reduce different metrics together.
+        existing = dict(loss_dict)
+        ordered = {
+            key: value for key, value in existing.items()
+            if not key.startswith('fu')
+        }
+        for index in range(num_future):
+            prefix = 'fu{}'.format(index + 1)
+            for name in _DSQE_FUTURE_LOSS_NAMES + _DSQE_DIAGNOSTIC_NAMES:
+                key = prefix + '.' + name
+                ordered[key] = existing.get(key, zero)
+        loss_dict.clear()
+        loss_dict.update(ordered)
+        return loss_dict
+
     def loss_future(self,
                     voxel_semantics,
                     all_refine_pts,
@@ -1091,6 +1150,10 @@ class OPUSHead(BaseModule):
                         output, cache).items():
                     loss_dict[prefix + '.' + name] = value
                 previous_output = output
+        if all_refine_pts:
+            zero = all_refine_pts[0].sum() * 0
+            self._fill_missing_dsqe_diagnostics(
+                loss_dict, len(all_refine_pts), zero)
         return loss_dict
 
     def loss_pretrain(self,voxel_semantic,temporal_semantics,temporal2ego, pred_dicts):
