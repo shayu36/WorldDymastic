@@ -55,11 +55,11 @@ flexibility, adaptability, and efficiency.
 
 
 ## Getting Started
-- [Installation](docs/install.md)
+- [Installation](introduction/install.md)
 
-- [Prepare Dataset](docs/prepare_datasets.md)
+- [Prepare Dataset](introduction/prepare_datasets.md)
 
-- [Train and Eval](docs/getting_started.md)
+- [Train and Eval](introduction/getting_started.md)
 
 
 ## Model Zoo
