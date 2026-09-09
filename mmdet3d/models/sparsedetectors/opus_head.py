@@ -21,38 +21,6 @@ colors = torch.tensor([
     [0.50, 0.00, 0.50],   # 紫 Purple
 ])
 
-# These diagnostics are emitted as scalar entries in the loss dictionary and
-# therefore must have the same key set on every DDP rank.  Some diagnostics
-# are legitimately unavailable for a local batch (for example, a rank may
-# contain no moving actor points), so ``loss_future`` fills the missing ones
-# with graph-connected zeros before returning.
-_DSQE_DIAGNOSTIC_NAMES = (
-    'role_accuracy', 'dynamic_ratio', 'dynamic_precision',
-    'dynamic_recall', 'dynamic_f1', 'gt_dynamic_ratio',
-    'pred_dynamic_ratio', 'mean_role_on_moving_gt',
-    'mean_role_on_static_gt', 'role_saturation_low',
-    'role_saturation_high', 'gate_dynamic_from_static',
-    'gate_static_from_dynamic',
-    'dynamic_delta_mean_x', 'dynamic_delta_mean_y',
-    'dynamic_delta_mean_z', 'dynamic_delta_abs_mean_x',
-    'dynamic_delta_abs_mean_y', 'dynamic_delta_abs_mean_z',
-    'dynamic_delta_p95_x', 'dynamic_delta_p95_y',
-    'dynamic_delta_p95_z', 'static_delta_mean_x',
-    'static_delta_mean_y', 'static_delta_mean_z',
-    'static_delta_abs_mean_x', 'static_delta_abs_mean_y',
-    'static_delta_abs_mean_z', 'static_delta_p95_x',
-    'static_delta_p95_y', 'static_delta_p95_z',
-    'query_motion_mean_x', 'query_motion_mean_y',
-    'query_motion_mean_z', 'query_motion_p95_x',
-    'query_motion_p95_y', 'query_motion_p95_z',
-    'static_warp_error_x', 'static_warp_error_y',
-    'static_warp_error_z', 'dynamic_displacement_error_x',
-    'dynamic_displacement_error_y', 'dynamic_displacement_error_z')
-
-_DSQE_FUTURE_LOSS_NAMES = (
-    'loss_cls', 'loss_pts', 'loss_role', 'loss_ego', 'loss_static',
-    'loss_dynamic', 'loss_smooth', 'loss_leak')
-
 
 @HEADS.register_module()
 class OPUSHead(BaseModule):
@@ -108,28 +76,16 @@ class OPUSHead(BaseModule):
         voxel_size = torch.tensor(voxel_size)
         voxel_num = (scene_size / voxel_size).long()
         self.pretrain = is_pretrain
-        self.freeze_tass = False
-        self.ind_stamps_all = None
         self.register_buffer('pc_range', pc_range)
         self.register_buffer('scene_size', scene_size)
         self.register_buffer('voxel_size', voxel_size)
         self.register_buffer('voxel_num', voxel_num)
 
         self._init_layers()
-        self.register_buffer(
-            'scene_size_new', torch.tensor([160, 120, 9.6]),
-            persistent=False)
-        self.register_buffer(
-            'pc_range_new', torch.tensor([-80, -60, -3, 80, 60, 6.6]),
-            persistent=False)
-        self.register_buffer(
-            'voxel_num_new', torch.tensor([400, 300, 24]),
-            persistent=False)
-        self.register_buffer(
-            'num_stamps_all',
-            torch.ones(
-                self.num_query + sum(self.num_fu_query),
-                self.num_fu_frames + 1).long())
+        self.scene_size_new = torch.tensor([160, 120, 9.6]).cuda()
+        self.pc_range_new = torch.tensor([-80, -60, -3, 80, 60, 6.6]).cuda()
+        self.voxel_num_new = torch.tensor([400,300,24]).cuda()
+        self.register_buffer("num_stamps_all", torch.ones(self.num_query+sum(self.num_fu_query),self.num_fu_frames+1).long())
 
 
     def _init_layers(self):
@@ -156,11 +112,11 @@ class OPUSHead(BaseModule):
             num_stamps_all = num_stamps_all / torch.sum(num_stamps_all, -1, keepdim=True)
             ind_stamps_all = get_matched_inds(num_stamps_all, [self.num_query] + self.num_fu_query)
             self.ind_stamps_all = ind_stamps_all
-            if not self.training or getattr(self, 'freeze_tass', False):
+            if not self.training:
                 self.reset_mask()
 
         # fu_query_feat = fu_init_points.new_zeros(B, fu_Q, self.embed_dims)
-        if self.pretrain and not getattr(self, 'freeze_tass', False):
+        if self.pretrain:
             num_stamps_all = self.num_stamps_all.float()
             num_stamps_all = num_stamps_all / torch.sum(num_stamps_all, -1, keepdim=True)
             ind_stamps_all = get_matched_inds(num_stamps_all, [self.num_query] + self.num_fu_query)
@@ -211,25 +167,24 @@ class OPUSHead(BaseModule):
     def _get_target_single(self, refine_pts, gt_points, gt_labels):
         # knn to apply Chamfer distance
         gt_paired_idx = knn(1, refine_pts[None, ...], gt_points[None, ...])
-        gt_paired_idx = gt_paired_idx.permute(0, 2, 1).reshape(-1).long()
+        gt_paired_idx = gt_paired_idx.permute(0, 2, 1).squeeze().long()
 
         pred_paired_idx = knn(1, gt_points[None, ...], refine_pts[None, ...])
 
-        pred_paired_idx = pred_paired_idx.permute(0, 2, 1).reshape(-1).long()
+        pred_paired_idx = pred_paired_idx.permute(0, 2, 1).squeeze().long()
         gt_paired_pts = refine_pts[gt_paired_idx]
         pred_paired_pts = gt_points[pred_paired_idx]
 
         # cls assignment
         refine_pts_labels = gt_labels[pred_paired_idx]
-        train_cfg = self.train_cfg or {}
-        cls_weights = train_cfg.get('cls_weights', [1] * self.num_classes)
+        cls_weights = self.train_cfg.get('cls_weights', [1] * self.num_classes)
         cls_weights = refine_pts.new_tensor(cls_weights)
         label_weights = cls_weights * \
                         self.get_dis_weight(pred_paired_pts)[..., None]
 
         # gt side assignment
-        empty_dist_thr = train_cfg.get('empty_dist_thr', 0.2)
-        empty_weights = train_cfg.get('empty_weights', 3)
+        empty_dist_thr = self.train_cfg.get('empty_dist_thr', 0.2)
+        empty_weights = self.train_cfg.get('empty_weights', 3)
 
         gt_pts_weights = refine_pts.new_ones(gt_paired_pts.shape[0])
         dist = torch.norm(gt_points - gt_paired_pts, dim=-1)
@@ -293,8 +248,7 @@ class OPUSHead(BaseModule):
             pred_paired_stamps.append(gt_stamps_list[i][pred_paired_idx_list[i]])
 
             fore_mask = (labels_list[i].reshape(num_query,-1,1)<2) | (labels_list[i].reshape(num_query,-1,1)>10)
-            if not getattr(self, 'freeze_tass', False):
-                self.num_stamps_all += (gt_stamps_list[i][pred_paired_idx_list[i]].reshape(num_query,num_pts,self.num_fu_frames+1) * fore_mask).sum(1)
+            self.num_stamps_all += (gt_stamps_list[i][pred_paired_idx_list[i]].reshape(num_query,num_pts,self.num_fu_frames+1) * fore_mask).sum(1)
 
             # gt_pts_weights[i] = gt_pts_weights[i] * mask[gt_paired_idx_list[i]].squeeze(-1) * dist_mask[i]
 
@@ -449,711 +403,34 @@ class OPUSHead(BaseModule):
 
 
 
-    @staticmethod
-    def _labels_in_classes(labels, class_ids):
-        mask = torch.zeros_like(labels, dtype=torch.bool)
-        for class_id in class_ids:
-            mask |= labels == class_id
-        return mask
+    def loss_future(self, voxel_semantics, all_refine_pts, all_cls_scores,points_mask):
+        # voxelsemantics [B, X200, Y200, Z16] unocuupied=17
 
-    @staticmethod
-    def _assign_motion_state_roles(gt_points, gt_labels, role_metadata,
-                                   static_ids):
-        """Assign continuous motion roles with conservative validity masks."""
-        role_target = gt_points.new_zeros(gt_points.shape[0])
-        role_valid = torch.zeros(
-            gt_points.shape[0], device=gt_points.device, dtype=torch.bool)
-        static_mask = OPUSHead._labels_in_classes(gt_labels, static_ids)
-        role_valid[static_mask] = True
-        if role_metadata is None or gt_points.numel() == 0:
-            return role_target, role_valid
-        centers = role_metadata['centers'].to(
-            device=gt_points.device, dtype=gt_points.dtype)
-        radius = role_metadata['radius'].to(
-            device=gt_points.device, dtype=gt_points.dtype)
-        actor_role = role_metadata['role'].to(
-            device=gt_points.device, dtype=gt_points.dtype)
-        actor_valid = role_metadata.get(
-            'valid', torch.ones_like(actor_role, dtype=torch.bool)).to(
-                device=gt_points.device).bool()
-        if centers.numel() == 0:
-            return role_target, role_valid
-        dims = role_metadata.get('dims')
-        yaw = role_metadata.get('yaw')
-        if dims is not None and yaw is not None and dims.numel() > 0:
-            dims = dims.to(device=gt_points.device, dtype=gt_points.dtype)
-            yaw = yaw.to(device=gt_points.device, dtype=gt_points.dtype)
-            delta = gt_points[:, None, :3] - centers[None, :, :3]
-            cos_yaw = yaw.cos()[None, :]
-            sin_yaw = yaw.sin()[None, :]
-            # Rotate points into each actor's local box frame.
-            local_x = cos_yaw * delta[..., 0] + sin_yaw * delta[..., 1]
-            local_y = -sin_yaw * delta[..., 0] + cos_yaw * delta[..., 1]
-            inside = (local_x.abs() <= dims[None, :, 0] * 0.5) & \
-                (local_y.abs() <= dims[None, :, 1] * 0.5)
-            if gt_points.shape[-1] >= 3 and dims.shape[-1] >= 3:
-                inside = inside & (
-                    delta[..., 2].abs() <= dims[None, :, 2] * 0.5)
-            # Select the nearest actor among boxes that actually contain the
-            # point.  This avoids assigning the rounded box corners or a
-            # distant overlapping actor to a voxel.
-            center_distance = torch.cdist(
-                gt_points[:, :2], centers[:, :2], p=2)
-            center_distance = center_distance.masked_fill(~inside, float('inf'))
-            nearest_distance, nearest_actor = center_distance.min(dim=1)
-            matched = torch.isfinite(nearest_distance) & \
-                actor_valid[nearest_actor] & ~static_mask
-        else:
-            distances = torch.cdist(gt_points[:, :2], centers[:, :2], p=2)
-            nearest_distance, nearest_actor = distances.min(dim=1)
-            matched = (nearest_distance <= radius[nearest_actor]) & \
-                actor_valid[nearest_actor] & ~static_mask
-        role_target[matched] = actor_role[nearest_actor[matched]]
-        role_valid[matched] = True
-        return role_target, role_valid
+        gt_points_list, gt_labels_list = [],  []
+        for voxel_sem in voxel_semantics:
+            gt_points,  gt_labels = \
+                self.get_sparse_voxels(voxel_sem)
+            gt_points_list.append(gt_points)
 
-    @torch.no_grad()
-    def build_future_match_cache(self, refine_pts, voxel_semantics,
-                                 role_metadata=None):
-        """Build one reusable bidirectional KNN assignment for a future step."""
-        batch_size, num_query, num_points = refine_pts.shape[:3]
-        decoded_points = decode_points(
-            refine_pts.reshape(batch_size, -1, 3), self.pc_range)
-        gt_points_list, gt_labels_list = self.get_sparse_voxels(
-            voxel_semantics)
+            gt_labels_list.append(gt_labels)
 
-        labels_list = []
-        gt_paired_idx_list = []
-        pred_paired_idx_list = []
-        label_weights_list = []
-        gt_pts_weights_list = []
-        valid_gt_list = []
-        gt_role_target_list = []
-        gt_role_valid_list = []
-        for batch_index in range(batch_size):
-            gt_points = gt_points_list[batch_index]
-            valid_gt = gt_points.shape[0] > 0
-            valid_gt_list.append(valid_gt)
-            if valid_gt:
-                match = self._get_target_single(
-                    decoded_points[batch_index],
-                    gt_points,
-                    gt_labels_list[batch_index])
-                labels, gt_index, pred_index, label_weight, gt_weight = match
-            else:
-                num_predictions = decoded_points.shape[1]
-                labels = torch.full(
-                    (num_predictions,), self.num_classes,
-                    device=decoded_points.device, dtype=torch.long)
-                gt_index = torch.empty(
-                    0, device=decoded_points.device, dtype=torch.long)
-                pred_index = torch.empty(
-                    0, device=decoded_points.device, dtype=torch.long)
-                label_weight = decoded_points.new_ones(
-                    num_predictions, self.num_classes)
-                gt_weight = decoded_points.new_empty(0)
-            static_ids = getattr(self, 'dsqe_cfg', {}).get(
-                'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16])
-            motion = None if role_metadata is None or batch_index >= len(role_metadata) \
-                else role_metadata[batch_index]
-            gt_role_target, gt_role_valid = self._assign_motion_state_roles(
-                gt_points, gt_labels_list[batch_index], motion, static_ids)
-            labels_list.append(labels)
-            gt_paired_idx_list.append(gt_index)
-            pred_paired_idx_list.append(pred_index)
-            label_weights_list.append(label_weight)
-            gt_pts_weights_list.append(gt_weight)
-            gt_role_target_list.append(gt_role_target)
-            gt_role_valid_list.append(gt_role_valid)
+        # all_cls_scores = torch.unbind(all_cls_scores,0)
+        all_gt_points_list = gt_points_list
+        all_gt_labels_list = gt_labels_list
 
-        config = getattr(self, 'dsqe_cfg', {})
-        labels = torch.stack(labels_list).reshape(
-            batch_size, num_query, num_points)
-        role_target_list = []
-        role_valid_list = []
-        for batch_index in range(batch_size):
-            # ``pred_paired_idx`` maps every predicted point to its nearest
-            # GT point (the KNN helper's second argument is the query set).
-            point_to_gt = pred_paired_idx_list[batch_index]
-            gt_role_target = gt_role_target_list[batch_index]
-            gt_role_valid = gt_role_valid_list[batch_index]
-            if point_to_gt.numel() == 0:
-                role_target_list.append(labels[batch_index].new_zeros(
-                    labels[batch_index].shape, dtype=torch.float32))
-                role_valid_list.append(torch.zeros_like(
-                    labels[batch_index], dtype=torch.bool))
-            else:
-                role_target_list.append(gt_role_target[point_to_gt].float())
-                role_valid_list.append(gt_role_valid[point_to_gt])
-        role_target = torch.stack(role_target_list).reshape(
-            batch_size, num_query, num_points)
-        role_valid = torch.stack(role_valid_list).reshape(
-            batch_size, num_query, num_points)
-        return dict(
-            labels_list=labels_list,
-            gt_paired_idx_list=gt_paired_idx_list,
-            pred_paired_idx_list=pred_paired_idx_list,
-            label_weights_list=label_weights_list,
-            gt_pts_weights_list=gt_pts_weights_list,
-            valid_gt_list=valid_gt_list,
-            gt_points_list=gt_points_list,
-            gt_labels_list=gt_labels_list,
-            gt_role_target_list=gt_role_target_list,
-            gt_role_valid_list=gt_role_valid_list,
-            role_target=role_target,
-            role_valid=role_valid,
-        )
+        losses_cls, losses_pts = multi_apply(
+            self.loss_single_rangemask, all_cls_scores, all_refine_pts,points_mask,
+            all_gt_points_list, all_gt_labels_list)
 
-    def _loss_future_cached(self, cls_scores, refine_pts, points_mask, cache):
-        batch_size = cls_scores.shape[0]
-        cls_scores_flat = cls_scores.reshape(
-            batch_size, -1, self.num_classes)
-        refine_pts_flat = decode_points(
-            refine_pts.reshape(batch_size, -1, 3), self.pc_range)
-        if points_mask is None:
-            points_mask = refine_pts_flat.new_ones(
-                refine_pts_flat.shape[:2])
-        else:
-            points_mask = points_mask.reshape(batch_size, -1).to(
-                refine_pts_flat.dtype)
-
-        gt_paired_points = []
-        pred_points = []
-        pred_paired_points = []
-        pred_range_weights = []
-        valid_gt_list = cache.get(
-            'valid_gt_list', [True] * batch_size)
-        for batch_index in range(batch_size):
-            gt_paired_points.append(refine_pts_flat[batch_index][
-                cache['gt_paired_idx_list'][batch_index]])
-            if valid_gt_list[batch_index]:
-                pred_points.append(refine_pts_flat[batch_index])
-                pred_paired_points.append(
-                    cache['gt_points_list'][batch_index][
-                        cache['pred_paired_idx_list'][batch_index]])
-                pred_range_weights.append(points_mask[batch_index])
-
-        scores = torch.cat([score for score in cls_scores_flat])
-        labels = torch.cat(cache['labels_list'])
-        label_weights = torch.cat(cache['label_weights_list'])
-        range_weights = points_mask.reshape(-1, 1)
-        loss_cls = self.loss_cls(
-            scores,
-            labels,
-            weight=label_weights * range_weights,
-            avg_factor=max(scores.shape[0], 1))
-
-        zero = refine_pts_flat.sum() * 0
-        gt_points = torch.cat(cache['gt_points_list'])
-        gt_paired_points = torch.cat(gt_paired_points)
-        gt_weights = torch.cat(cache['gt_pts_weights_list'])
-        loss_pts = zero
-        if gt_points.shape[0] > 0:
-            loss_pts = self.loss_pts(
-                gt_points,
-                gt_paired_points,
-                weight=gt_weights[..., None],
-                avg_factor=gt_points.shape[0])
-        if pred_points:
-            pred_points = torch.cat(pred_points)
-            pred_paired_points = torch.cat(pred_paired_points)
-            pred_range_weights = torch.cat(pred_range_weights).reshape(-1, 1)
-            loss_pts = loss_pts + self.loss_pts(
-                pred_points,
-                pred_paired_points,
-                weight=pred_range_weights,
-                avg_factor=pred_points.shape[0])
-        return loss_cls, loss_pts, refine_pts_flat
-
-    @staticmethod
-    def _masked_mean(values, mask):
-        mask = mask.to(values.dtype)
-        while mask.ndim < values.ndim:
-            mask = mask.unsqueeze(-1)
-        return (values * mask).sum() / mask.sum().clamp_min(1.0)
-
-    def _loss_role(self, output, cache):
-        role_logits = output['role_logits'].squeeze(-1)
-        role_target = cache['role_target'].to(role_logits.dtype)
-        role_valid = cache['role_valid']
-        config = self.dsqe_cfg
-        gamma = config.get('role_gamma', 2.0)
-        alpha = config.get('role_alpha', 0.75)
-
-        bce = F.binary_cross_entropy_with_logits(
-            role_logits, role_target, reduction='none')
-        role_probability = role_logits.sigmoid()
-        pt = role_probability * role_target + \
-            (1 - role_probability) * (1 - role_target)
-        alpha_weight = alpha * role_target + \
-            (1 - alpha) * (1 - role_target)
-        point_loss = self._masked_mean(
-            alpha_weight * (1 - pt).pow(gamma) * bce, role_valid)
-
-        pool_weights = output['pool_weights'].squeeze(-1)
-        valid_weights = pool_weights * role_valid.to(pool_weights.dtype)
-        query_target = (valid_weights * role_target).sum(dim=2) / \
-            valid_weights.sum(dim=2).clamp_min(1e-6)
-        query_valid = role_valid.any(dim=2)
-        query_probability = output['query_role'].squeeze(-1).clamp(
-            1e-5, 1 - 1e-5)
-        query_bce = F.binary_cross_entropy(
-            query_probability, query_target, reduction='none')
-        query_loss = self._masked_mean(query_bce, query_valid)
-        return point_loss + config.get('role_query_weight', 0.5) * query_loss
-
-    def _loss_static(self, output, cache):
-        reference = output.get('static_reference_metric')
-        if reference is None or output['num_carried'] == 0:
-            return output['points_metric'].sum() * 0
-        num_carried = output['num_carried']
-        role_target = cache['role_target'][:, :num_carried]
-        role_valid = cache['role_valid'][:, :num_carried]
-        static_mask = role_valid & (role_target < 0.5)
-        error = (output['points_metric'][:, :num_carried] - reference).abs()
-        return self._masked_mean(error, static_mask)
-
-    def _loss_dynamic(self, cls_scores, output, cache, refine_pts_flat):
-        dynamic_ids = self.dsqe_cfg.get(
-            'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10])
-        batch_size = cls_scores.shape[0]
-        scores_flat = cls_scores.reshape(
-            batch_size, -1, self.num_classes)
-        pred_distance_sum = refine_pts_flat.new_tensor(0.0)
-        gt_distance_sum = refine_pts_flat.new_tensor(0.0)
-        pred_count = refine_pts_flat.new_tensor(0.0)
-        gt_count = refine_pts_flat.new_tensor(0.0)
-        dynamic_scores = []
-        dynamic_labels = []
-        dynamic_weights = []
-
-        valid_gt_list = cache.get('valid_gt_list', [True] * batch_size)
-        for batch_index in range(batch_size):
-            if not valid_gt_list[batch_index]:
-                continue
-            gt_points = cache['gt_points_list'][batch_index]
-            point_to_gt = cache['pred_paired_idx_list'][batch_index]
-            pred_target = gt_points[point_to_gt]
-            count = min(refine_pts_flat.shape[1], pred_target.shape[0])
-            pred_error = refine_pts_flat.new_zeros(refine_pts_flat.shape[1])
-            if count > 0:
-                pred_error[:count] = (
-                    refine_pts_flat[batch_index, :count] -
-                    pred_target[:count]).abs().mean(dim=-1)
-            role_target = cache['role_target'][batch_index].reshape(-1)
-            role_valid = cache['role_valid'][batch_index].reshape(-1)
-            pred_role = output['role_pred'][batch_index].reshape(-1)
-            # Softly weight every valid candidate.  There is intentionally no
-            # ``pred_role > 0.5`` branch, so low-confidence roles still train.
-            # Keep a non-zero floor for low-confidence roles and normalize by
-            # GT role mass rather than the same prediction-dependent weight.
-            # This preserves a useful geometric gradient even when every
-            # predicted role is below 0.5.  ``detach`` is intentional: the
-            # geometry term must not lower the role probability merely to
-            # reduce its own weight; role BCE supervision owns that gradient.
-            geometry_weight = 0.25 + 0.75 * pred_role.detach()
-            dynamic_weight = role_target * geometry_weight * \
-                role_valid.to(pred_role.dtype)
-            dynamic_weight = dynamic_weight[:pred_error.shape[0]]
-            pred_distance_sum = pred_distance_sum + \
-                (pred_error * dynamic_weight).sum()
-            pred_count = pred_count + (
-                role_target[:pred_error.shape[0]] *
-                role_valid[:pred_error.shape[0]].to(pred_role.dtype)).sum()
-
-            gt_role_targets = cache.get('gt_role_target_list')
-            gt_role_valids = cache.get('gt_role_valid_list')
-            gt_role_target = None if gt_role_targets is None or \
-                batch_index >= len(gt_role_targets) else \
-                gt_role_targets[batch_index]
-            gt_role_valid = None if gt_role_valids is None or \
-                batch_index >= len(gt_role_valids) else \
-                gt_role_valids[batch_index]
-            if gt_role_target is not None and gt_role_target.numel() > 0:
-                # Keep every non-static actor candidate and use its soft
-                # motion role as a continuous geometry weight.
-                dynamic_gt_mask = gt_role_valid & (gt_role_target > 0)
-                if dynamic_gt_mask.any():
-                    dynamic_gt_points = cache['gt_points_list'][batch_index][
-                        dynamic_gt_mask]
-                    dynamic_gt_role = gt_role_target[dynamic_gt_mask]
-                    pred_points = refine_pts_flat[batch_index]
-                    # GT -> prediction coverage: every moving GT point must
-                    # find a predicted point.  The previous implementation
-                    # repeated the prediction -> GT direction and could
-                    # therefore miss uncovered moving regions.
-                    nearest_pred = self._chunked_nearest_indices(
-                        dynamic_gt_points, pred_points,
-                        self.dsqe_cfg.get('dynamic_cdist_chunk_size', 1024))
-                    gt_error = (dynamic_gt_points -
-                                pred_points[nearest_pred]).abs().mean(dim=-1)
-                    gt_weight = dynamic_gt_role * (
-                        0.25 + 0.75 * pred_role[nearest_pred].detach())
-                    gt_distance_sum = gt_distance_sum + \
-                        (gt_weight * gt_error).sum()
-                    gt_count = gt_count + dynamic_gt_role.sum()
-
-            labels = cache['labels_list'][batch_index]
-            semantic_dynamic_mask = self._labels_in_classes(labels, dynamic_ids)
-            if semantic_dynamic_mask.any():
-                dynamic_scores.append(scores_flat[batch_index][semantic_dynamic_mask])
-                dynamic_labels.append(labels[semantic_dynamic_mask])
-                dynamic_weights.append(
-                    cache['label_weights_list'][batch_index][
-                        semantic_dynamic_mask])
-
-        distance_loss = pred_distance_sum / pred_count.clamp_min(1) + \
-            gt_distance_sum / gt_count.clamp_min(1)
-        classification_loss = refine_pts_flat.sum() * 0
-        if dynamic_scores:
-            dynamic_scores = torch.cat(dynamic_scores)
-            dynamic_labels = torch.cat(dynamic_labels)
-            dynamic_weights = torch.cat(dynamic_weights)
-            classification_loss = self.loss_cls(
-                dynamic_scores,
-                dynamic_labels,
-                weight=dynamic_weights,
-                avg_factor=max(dynamic_scores.shape[0], 1))
-        return distance_loss + self.dsqe_cfg.get(
-            'dynamic_cls_weight', 1.0) * classification_loss
-
-    @staticmethod
-    def _chunked_nearest_indices(query_points, reference_points,
-                                 chunk_size=1024):
-        """Exact L1 nearest neighbors with bounded pairwise memory."""
-        if query_points.shape[0] == 0 or reference_points.shape[0] == 0:
-            return torch.empty(
-                query_points.shape[0], device=query_points.device,
-                dtype=torch.long)
-        if chunk_size <= 0:
-            raise ValueError('dynamic_cdist_chunk_size must be positive')
-
-        nearest_indices = []
-        with torch.no_grad():
-            query = query_points.detach().float()
-            reference = reference_points.detach().float()
-            for query_start in range(0, query.shape[0], chunk_size):
-                query_chunk = query[query_start:query_start + chunk_size]
-                best_distance = query_chunk.new_full(
-                    (query_chunk.shape[0],), float('inf'))
-                best_index = torch.zeros(
-                    query_chunk.shape[0], device=query.device,
-                    dtype=torch.long)
-                for ref_start in range(0, reference.shape[0], chunk_size):
-                    reference_chunk = reference[
-                        ref_start:ref_start + chunk_size]
-                    distance = torch.cdist(
-                        query_chunk, reference_chunk, p=1)
-                    chunk_distance, chunk_index = distance.min(dim=1)
-                    update = chunk_distance < best_distance
-                    best_distance = torch.where(
-                        update, chunk_distance, best_distance)
-                    best_index = torch.where(
-                        update, chunk_index + ref_start, best_index)
-                nearest_indices.append(best_index)
-        return torch.cat(nearest_indices)
-
-    def _loss_ego(self, output):
-        target = output.get('gt_relative_pose')
-        if target is None:
-            return output['predicted_relative_pose'].sum() * 0
-        prediction = output['predicted_relative_pose']
-        translation_loss = F.l1_loss(
-            prediction[..., :2], target[..., :2])
-        prediction_yaw = F.normalize(prediction[..., 2:4], dim=-1)
-        target_yaw = F.normalize(target[..., 2:4], dim=-1)
-        yaw_loss = 1 - (prediction_yaw * target_yaw).sum(dim=-1).mean()
-        return translation_loss + self.dsqe_cfg.get(
-            'ego_yaw_weight', 1.0) * yaw_loss
-
-    def _loss_leak(self, output, cache):
-        if output['num_carried'] == 0:
-            return output['query_motion'].sum() * 0
-        num_carried = output['num_carried']
-        role_target = cache['role_target'][:, :num_carried]
-        role_valid = cache['role_valid'][:, :num_carried]
-        static_fraction = (role_valid & (role_target < 0.5)).float().mean(dim=2)
-        motion = output['query_motion'].abs().mean(dim=-1)
-        return (motion * static_fraction).sum() / \
-            static_fraction.sum().clamp_min(1.0)
-
-    @staticmethod
-    def _loss_smooth(previous_output, output):
-        if previous_output is None:
-            return output['query_motion'].sum() * 0
-        overlap = min(previous_output['query_motion'].shape[1],
-                      output['query_motion'].shape[1])
-        if overlap == 0:
-            return output['query_motion'].sum() * 0
-        return F.l1_loss(
-            output['query_motion'][:, :overlap],
-            previous_output['query_motion'][:, :overlap])
-
-    @staticmethod
-    def _role_diagnostics(output, cache):
-        target = cache['role_target'] >= 0.5
-        valid = cache['role_valid']
-        prediction = output['role_pred'].squeeze(-1) >= 0.5
-        correct = ((prediction == target) & valid).sum()
-        accuracy = correct.to(output['role_pred'].dtype) / \
-            valid.sum().clamp_min(1)
-        prediction_float = output['role_pred'].squeeze(-1)
-        valid_float = valid.to(prediction_float.dtype)
-        dynamic_ratio = (prediction_float * valid_float).sum() / \
-            valid_float.sum().clamp_min(1)
-        gt_dynamic = (target & valid)
-        pred_dynamic = prediction & valid
-        true_positive = (pred_dynamic & gt_dynamic).sum().float()
-        precision = true_positive / pred_dynamic.sum().clamp_min(1).float()
-        recall = true_positive / gt_dynamic.sum().clamp_min(1).float()
-        f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-6)
-        moving_mean = prediction_float[gt_dynamic].mean() \
-            if gt_dynamic.any() else prediction_float.sum() * 0
-        static_mask = valid & ~target
-        static_mean = prediction_float[static_mask].mean() \
-            if static_mask.any() else prediction_float.sum() * 0
-        low = ((prediction_float < 0.05) & valid).float().sum() / \
-            valid_float.sum().clamp_min(1)
-        high = ((prediction_float > 0.95) & valid).float().sum() / \
-            valid_float.sum().clamp_min(1)
-        dynamic_from_static, static_from_dynamic = output['interaction_gates']
-        return dict(
-            role_accuracy=accuracy.detach(),
-            dynamic_ratio=dynamic_ratio.detach(),
-            dynamic_precision=precision.detach(),
-            dynamic_recall=recall.detach(),
-            dynamic_f1=f1.detach(),
-            gt_dynamic_ratio=gt_dynamic.float().sum().detach() /
-            valid_float.sum().clamp_min(1).detach(),
-            pred_dynamic_ratio=pred_dynamic.float().sum().detach() /
-            valid_float.sum().clamp_min(1).detach(),
-            mean_role_on_moving_gt=moving_mean.detach(),
-            mean_role_on_static_gt=static_mean.detach(),
-            role_saturation_low=low.detach(),
-            role_saturation_high=high.detach(),
-            gate_dynamic_from_static=dynamic_from_static.detach(),
-            gate_static_from_dynamic=static_from_dynamic.detach())
-
-    @staticmethod
-    def _residual_diagnostics(output):
-        values = {}
-        for name in ('dynamic_delta', 'static_delta'):
-            residual = output.get(name)
-            if residual is None:
-                continue
-            values[name + '_mean_x'] = residual[..., 0].mean().detach()
-            values[name + '_mean_y'] = residual[..., 1].mean().detach()
-            values[name + '_mean_z'] = residual[..., 2].mean().detach()
-            values[name + '_abs_mean_x'] = residual[..., 0].abs().mean().detach()
-            values[name + '_abs_mean_y'] = residual[..., 1].abs().mean().detach()
-            values[name + '_abs_mean_z'] = residual[..., 2].abs().mean().detach()
-            flat = residual.reshape(-1, 3).abs()
-            p95 = torch.quantile(flat, 0.95, dim=0)
-            values[name + '_p95_x'] = p95[0].detach()
-            values[name + '_p95_y'] = p95[1].detach()
-            values[name + '_p95_z'] = p95[2].detach()
-        return values
-
-    @staticmethod
-    def _motion_diagnostics(output):
-        motion = output.get('query_motion')
-        if motion is None or motion.numel() == 0:
-            return {}
-        values = {}
-        for axis, label in enumerate(('x', 'y', 'z')):
-            values['query_motion_mean_' + label] = \
-                motion[..., axis].mean().detach()
-        p95 = torch.quantile(
-            motion.reshape(-1, 3).abs(), 0.95, dim=0)
-        for axis, label in enumerate(('x', 'y', 'z')):
-            values['query_motion_p95_' + label] = p95[axis].detach()
-        return values
-
-    def _geometry_diagnostics(self, output, cache):
-        """Report soft static-warp and dynamic-displacement errors."""
-        values = {}
-        num_carried = output.get('num_carried', 0)
-        role_target = cache.get('role_target')
-        role_valid = cache.get('role_valid')
-        if (num_carried > 0 and role_target is not None and
-                role_valid is not None and
-                output.get('static_reference_metric') is not None):
-            reference = output['static_reference_metric']
-            points = output['points_metric'][:, :num_carried]
-            static_error = (points - reference).abs()
-            static_mask = role_valid[:, :num_carried] & \
-                (role_target[:, :num_carried] < 0.5)
-            denom = static_mask.to(static_error.dtype).sum().clamp_min(1.0)
-            for axis, label in enumerate(('x', 'y', 'z')):
-                values['static_warp_error_' + label] = \
-                    (static_error[..., axis] * static_mask.to(
-                        static_error.dtype)).sum().detach() / denom
-
-        gt_roles = cache.get('gt_role_target_list')
-        gt_valids = cache.get('gt_role_valid_list')
-        if gt_roles is None or gt_valids is None:
-            return values
-        dynamic_errors = []
-        for batch_index, (gt_role, gt_valid) in enumerate(
-                zip(gt_roles, gt_valids)):
-            dynamic_mask = gt_valid & (gt_role > 0)
-            if not dynamic_mask.any():
-                continue
-            gt_points = cache['gt_points_list'][batch_index][dynamic_mask]
-            gt_role = gt_role[dynamic_mask]
-            batch_points = output['points_metric'][batch_index].reshape(-1, 3)
-            nearest_pred = OPUSHead._chunked_nearest_indices(
-                gt_points.detach(), batch_points.detach(),
-                getattr(self, 'dsqe_cfg', {}).get(
-                    'dynamic_cdist_chunk_size', 1024)
-                if hasattr(self, 'dsqe_cfg') else 1024)
-            matched_points = batch_points[nearest_pred]
-            matched_roles = output['role_pred'][batch_index].reshape(
-                -1).detach()[nearest_pred]
-            dynamic_errors.append(((matched_points - gt_points).abs(),
-                                   (0.25 + 0.75 * matched_roles) *
-                                   gt_role.detach()))
-        if dynamic_errors:
-            dynamic_error = torch.cat([value for value, _ in dynamic_errors],
-                                      dim=0)
-            dynamic_weight = torch.cat([weight for _, weight in dynamic_errors],
-                                        dim=0)
-            denom = dynamic_weight.sum().clamp_min(1e-6)
-            for axis, label in enumerate(('x', 'y', 'z')):
-                values['dynamic_displacement_error_' + label] = \
-                    (dynamic_error[..., axis] * dynamic_weight).sum().detach() \
-                    / denom
-        return values
-
-    @staticmethod
-    def _fill_missing_dsqe_diagnostics(loss_dict, num_future, zero):
-        """Keep DDP ``log_vars`` identical when local diagnostics are absent.
-
-        Diagnostic values are intentionally detached by their producers, but
-        the fallback remains connected to the loss graph through ``zero`` so
-        this helper is also safe for callers that use the returned dictionary
-        to construct a scalar loss.
-        """
-        # ``BaseDetector._parse_losses`` reduces values in insertion order.
-        # Rebuild the dictionary in a canonical per-future-step order rather
-        # than merely appending missing keys; otherwise ranks with different
-        # diagnostics would silently all-reduce different metrics together.
-        existing = dict(loss_dict)
-        ordered = {
-            key: value for key, value in existing.items()
-            if not key.startswith('fu')
-        }
-        for index in range(num_future):
-            prefix = 'fu{}'.format(index + 1)
-            for name in _DSQE_FUTURE_LOSS_NAMES + _DSQE_DIAGNOSTIC_NAMES:
-                key = prefix + '.' + name
-                ordered[key] = existing.get(key, zero)
-        loss_dict.clear()
-        loss_dict.update(ordered)
-        return loss_dict
-
-    def loss_future(self,
-                    voxel_semantics,
-                    all_refine_pts,
-                    all_cls_scores,
-                    points_mask,
-                    dsqe_outputs=None,
-                    match_cache_list=None):
         loss_dict = dict()
-        previous_output = None
-        config = getattr(self, 'dsqe_cfg', {})
-        for index, (voxel_semantic, refine_pts, cls_scores) in enumerate(zip(
-                voxel_semantics, all_refine_pts, all_cls_scores)):
-            prefix = 'fu{}'.format(index + 1)
-            if self.pretrain:
-                output = None if dsqe_outputs is None else dsqe_outputs[index]
-                residual_graph = refine_pts.sum() + cls_scores.sum()
-                if output is not None:
-                    for name in ('delta_feat', 'delta_points',
-                                 'semantic_correction', 'query_motion'):
-                        value = output.get(name)
-                        if value is not None:
-                            residual_graph = residual_graph + value.sum()
-                zero = residual_graph * 0
-                loss_dict[prefix + '.loss_cls'] = zero
-                loss_dict[prefix + '.loss_pts'] = zero
-                if dsqe_outputs is not None:
-                    cache = None if match_cache_list is None else \
-                        match_cache_list[index]
-                    if cache is not None:
-                        role_loss = self._loss_role(output, cache)
-                        ego_loss = self._loss_ego(output)
-                        loss_dict[prefix + '.loss_role'] = \
-                            config.get('lambda_role', 0.5) * role_loss
-                        loss_dict[prefix + '.loss_ego'] = \
-                            config.get('lambda_ego', 1.0) * ego_loss
-                        for name, value in self._role_diagnostics(
-                                output, cache).items():
-                            loss_dict[prefix + '.' + name] = value
-                        for name, value in self._residual_diagnostics(output).items():
-                            loss_dict[prefix + '.' + name] = value
-                        for name, value in self._motion_diagnostics(output).items():
-                            loss_dict[prefix + '.' + name] = value
-                        for name, value in self._geometry_diagnostics(
-                                output, cache).items():
-                            loss_dict[prefix + '.' + name] = value
-                    else:
-                        role_zero = output['role_logits'].sum() * 0
-                        loss_dict[prefix + '.loss_role'] = role_zero
-                        loss_dict[prefix + '.loss_ego'] = zero
-                    for name in ('static', 'dynamic', 'smooth', 'leak'):
-                        loss_dict[prefix + '.loss_' + name] = zero
-                continue
+        # loss of init_points
 
-            cache = None if match_cache_list is None else \
-                match_cache_list[index]
-            if cache is None:
-                cache = self.build_future_match_cache(
-                    refine_pts, voxel_semantic)
-            point_mask = None if points_mask is None else points_mask[index]
-            loss_cls, loss_pts, refine_pts_flat = self._loss_future_cached(
-                cls_scores, refine_pts, point_mask, cache)
-            loss_dict[prefix + '.loss_cls'] = loss_cls
-            loss_dict[prefix + '.loss_pts'] = loss_pts
-
-            if dsqe_outputs is not None:
-                output = dsqe_outputs[index]
-                role_loss = self._loss_role(output, cache)
-                ego_loss = self._loss_ego(output)
-                loss_dict[prefix + '.loss_role'] = \
-                    config.get('lambda_role', 0.5) * role_loss
-                loss_dict[prefix + '.loss_ego'] = \
-                    config.get('lambda_ego', 1.0) * ego_loss
-
-                geometry_weight = float(not self.pretrain)
-                loss_dict[prefix + '.loss_static'] = geometry_weight * \
-                    config.get('lambda_static', 0.2) * \
-                    self._loss_static(output, cache)
-                loss_dict[prefix + '.loss_dynamic'] = geometry_weight * \
-                    config.get('lambda_dynamic', 0.5) * \
-                    self._loss_dynamic(
-                        cls_scores, output, cache, refine_pts_flat)
-                loss_dict[prefix + '.loss_smooth'] = geometry_weight * \
-                    config.get('lambda_smooth', 0.05) * \
-                    self._loss_smooth(previous_output, output)
-                loss_dict[prefix + '.loss_leak'] = geometry_weight * \
-                    config.get('lambda_leak', 0.05) * \
-                    self._loss_leak(output, cache)
-                for name, value in self._role_diagnostics(
-                        output, cache).items():
-                    loss_dict[prefix + '.' + name] = value
-                for name, value in self._residual_diagnostics(output).items():
-                    loss_dict[prefix + '.' + name] = value
-                for name, value in self._motion_diagnostics(output).items():
-                    loss_dict[prefix + '.' + name] = value
-                for name, value in self._geometry_diagnostics(
-                        output, cache).items():
-                    loss_dict[prefix + '.' + name] = value
-                previous_output = output
-        if all_refine_pts:
-            zero = all_refine_pts[0].sum() * 0
-            self._fill_missing_dsqe_diagnostics(
-                loss_dict, len(all_refine_pts), zero)
+        # loss from other decoder layers
+        time_stamp = 1
+        for loss_cls_i, loss_pts_i in zip(losses_cls, losses_pts):
+            loss_dict[f'fu{time_stamp}.loss_cls'] = loss_cls_i * (not self.pretrain)
+            loss_dict[f'fu{time_stamp}.loss_pts'] = loss_pts_i * (not self.pretrain)
+            time_stamp += 1
         return loss_dict
 
     def loss_pretrain(self,voxel_semantic,temporal_semantics,temporal2ego, pred_dicts):

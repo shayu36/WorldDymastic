@@ -115,54 +115,6 @@ model = dict(
     stop_prev_grad=0,
     is_pretrain = pretrain,
     finetune_epoch=finetune_epoch,
-    dsqe_cfg=dict(
-        enabled=True,
-        frame_mode='future_ego',
-        dynamic_class_ids=[2, 3, 4, 5, 6, 7, 9, 10],
-        static_class_ids=[1, 8, 11, 12, 13, 14, 15, 16],
-        beta=0.7,
-        num_heads=8,
-        local_k=16,
-        dropout=0.1,
-        use_checkpoint=True,
-        static_alpha=0.1,
-        static_alpha_max=0.2,
-        motion_scale=4.0,
-        dynamic_residual_scale=1.0,
-        new_residual_scale=2.0,
-        semantic_residual_scale=0.5,
-        role_correction_scale=0.25,
-        dynamic_from_static_init=1.0,
-        static_from_dynamic_init=0.25,
-        stream_dropout=0.1,
-        role_teacher_forcing=1.0,
-        ego_teacher_forcing=1.0,
-        teacher_forcing_start_epoch=finetune_epoch,
-        teacher_forcing_end_epoch=finetune_epoch + 12,
-        dsqe_training_stage='residual_stage1',
-        freeze_baseline=True,
-        freeze_tass=True,
-        planning_gradient_to_dsqe=False,
-        feature_residual_scale=1.0,
-        dynamic_point_delta_scale=1.0,
-        static_point_delta_scale=0.2,
-        role_speed_threshold=0.5,
-        # A sharp but differentiable speed-to-role mapping keeps stationary
-        # actors near zero while preserving high roles for moving actors.
-        role_speed_temperature=0.1,
-        role_frame_dt=0.5,
-        role_gamma=2.0,
-        role_alpha=0.75,
-        role_query_weight=0.5,
-        dynamic_cls_weight=1.0,
-        dynamic_cdist_chunk_size=1024,
-        ego_yaw_weight=1.0,
-        lambda_role=0.5,
-        lambda_static=0.2,
-        lambda_dynamic=0.5,
-        lambda_ego=1.0,
-        lambda_smooth=0.05,
-        lambda_leak=0.05),
     img_backbone=img_backbone,
     img_neck=img_neck,
     pts_bbox_head=dict(
@@ -242,7 +194,6 @@ train_pipeline = [
         type='Collect4D', keys=['img', 'voxel_semantics',
                                 'mask_lidar','mask_camera',
                                  'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_ego2global',
-                                'temporal_agent_boxes', 'temporal_agent_feats',
                                ],meta_keys = ('filename','ori_shape','img_shape','pad_shape','lidar2img','img_timestamp','ego2lidar','ego2global','sample_idx',))
 ]
 
@@ -294,7 +245,7 @@ test_data_config = dict(
     ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')
 
 data = dict(
-    samples_per_gpu=1,  # one sample per GPU for six-step DSQE training
+    samples_per_gpu=1,  # one sample per GPU for six-step temporal training
     workers_per_gpu=4,
     train=dict(
         data_root=data_root,
