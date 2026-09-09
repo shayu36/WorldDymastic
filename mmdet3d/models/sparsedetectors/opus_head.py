@@ -403,7 +403,179 @@ class OPUSHead(BaseModule):
 
 
 
-    def loss_future(self, voxel_semantics, all_refine_pts, all_cls_scores,points_mask):
+    @staticmethod
+    def _labels_in_classes(labels, class_ids):
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        for class_id in class_ids:
+            mask |= labels == class_id
+        return mask
+
+    @staticmethod
+    def _assign_motion_state_roles(gt_points, gt_labels, role_metadata,
+                                   static_ids):
+        role_target = gt_points.new_zeros(gt_points.shape[0])
+        role_valid = torch.zeros(gt_points.shape[0], device=gt_points.device,
+                                 dtype=torch.bool)
+        static_mask = OPUSHead._labels_in_classes(gt_labels, static_ids)
+        role_valid[static_mask] = True
+        if role_metadata is None or not gt_points.numel():
+            return role_target, role_valid
+        centers = role_metadata['centers'].to(gt_points)
+        radius = role_metadata['radius'].to(gt_points)
+        actor_role = role_metadata['role'].to(gt_points)
+        actor_valid = role_metadata.get(
+            'valid', torch.ones_like(actor_role, dtype=torch.bool)).to(
+                gt_points.device).bool()
+        if not centers.numel():
+            return role_target, role_valid
+        distance = torch.cdist(gt_points[:, :2], centers[:, :2])
+        nearest, index = distance.min(dim=1)
+        matched = ((nearest <= radius[index]) & actor_valid[index] &
+                   ~static_mask)
+        if 'dims' in role_metadata and 'yaw' in role_metadata:
+            dims = role_metadata['dims'].to(gt_points)
+            yaw = role_metadata['yaw'].to(gt_points)
+            delta = gt_points[:, :2] - centers[index, :2]
+            c, s = yaw[index].cos(), yaw[index].sin()
+            local_x = c * delta[:, 0] + s * delta[:, 1]
+            local_y = -s * delta[:, 0] + c * delta[:, 1]
+            footprint = ((local_x.abs() <= dims[index, 0] * 0.5) &
+                         (local_y.abs() <= dims[index, 1] * 0.5))
+            matched &= footprint
+        role_target[matched] = actor_role[index[matched]]
+        role_valid[matched] = True
+        return role_target, role_valid
+
+    @staticmethod
+    def _chunked_nearest_indices(query_points, reference_points,
+                                 chunk_size=1024):
+        if query_points.shape[0] == 0 or reference_points.shape[0] == 0:
+            return torch.empty(query_points.shape[0], device=query_points.device,
+                               dtype=torch.long)
+        nearest = []
+        with torch.no_grad():
+            query_points = query_points.detach().float()
+            reference_points = reference_points.detach().float()
+            for start in range(0, query_points.shape[0], chunk_size):
+                query = query_points[start:start + chunk_size]
+                best_distance = query.new_full((query.shape[0],), float('inf'))
+                best_index = torch.zeros(query.shape[0], device=query.device,
+                                         dtype=torch.long)
+                for ref_start in range(0, reference_points.shape[0], chunk_size):
+                    ref = reference_points[ref_start:ref_start + chunk_size]
+                    distance = torch.cdist(query, ref, p=1)
+                    current_distance, current_index = distance.min(dim=1)
+                    update = current_distance < best_distance
+                    best_distance = torch.where(update, current_distance,
+                                                best_distance)
+                    best_index = torch.where(update, current_index + ref_start,
+                                             best_index)
+                nearest.append(best_index)
+        return torch.cat(nearest)
+
+    @torch.no_grad()
+    def build_future_match_cache(self, refine_pts, voxel_semantics,
+                                 role_metadata=None):
+        batch_size, num_query, num_points = refine_pts.shape[:3]
+        decoded = decode_points(refine_pts.reshape(batch_size, -1, 3),
+                                self.pc_range)
+        gt_points_list, gt_labels_list = self.get_sparse_voxels(voxel_semantics)
+        labels_list, gt_index_list, pred_index_list = [], [], []
+        cls_weight_list, gt_weight_list = [], []
+        role_target_list, role_valid_list = [], []
+        static_ids = getattr(self, 'dsqe_cfg', {}).get(
+            'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16])
+        for b in range(batch_size):
+            gt_points, gt_labels = gt_points_list[b], gt_labels_list[b]
+            if gt_points.numel():
+                labels, gt_index, pred_index, cls_weight, gt_weight = \
+                    self._get_target_single(decoded[b], gt_points, gt_labels)
+            else:
+                n = decoded.shape[1]
+                labels = decoded.new_full((n,), self.num_classes, dtype=torch.long)
+                gt_index = pred_index = torch.empty(0, device=decoded.device,
+                                                    dtype=torch.long)
+                cls_weight = decoded.new_ones(n, self.num_classes)
+                gt_weight = decoded.new_empty(0)
+            motion = None if role_metadata is None or b >= len(role_metadata) \
+                else role_metadata[b]
+            target, valid = self._assign_motion_state_roles(
+                gt_points, gt_labels, motion, static_ids)
+            labels_list.append(labels); gt_index_list.append(gt_index)
+            pred_index_list.append(pred_index); cls_weight_list.append(cls_weight)
+            gt_weight_list.append(gt_weight); role_target_list.append(target)
+            role_valid_list.append(valid)
+        role_targets, role_valids = [], []
+        for b in range(batch_size):
+            pred_index = pred_index_list[b]
+            if pred_index.numel():
+                role_targets.append(role_target_list[b][pred_index].float())
+                role_valids.append(role_valid_list[b][pred_index])
+            else:
+                role_targets.append(decoded.new_zeros(decoded.shape[1]))
+                role_valids.append(torch.zeros(decoded.shape[1], device=decoded.device,
+                                               dtype=torch.bool))
+        return dict(labels_list=labels_list, gt_paired_idx_list=gt_index_list,
+                    pred_paired_idx_list=pred_index_list,
+                    label_weights_list=cls_weight_list,
+                    gt_pts_weights_list=gt_weight_list,
+                    valid_gt_list=[bool(x.numel()) for x in gt_points_list],
+                    gt_points_list=gt_points_list, gt_labels_list=gt_labels_list,
+                    gt_role_target_list=role_target_list,
+                    gt_role_valid_list=role_valid_list,
+                    role_target=torch.stack(role_targets).reshape(
+                        batch_size, num_query, num_points),
+                    role_valid=torch.stack(role_valids).reshape(
+                        batch_size, num_query, num_points))
+
+    @staticmethod
+    def _masked_mean(values, mask):
+        mask = mask.to(values.dtype)
+        while mask.ndim < values.ndim:
+            mask = mask.unsqueeze(-1)
+        return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+    def _loss_role(self, output, cache):
+        logits = output['role_logits'].squeeze(-1)
+        target = cache['role_target'].to(logits.dtype)
+        valid = cache['role_valid']
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+        point_loss = self._masked_mean(bce, valid)
+        pool = output.get('pool_weights')
+        query = output.get('query_role')
+        if pool is None or query is None:
+            return point_loss
+        weights = pool.squeeze(-1) * valid.to(pool.dtype)
+        q_target = (weights * target).sum(2) / weights.sum(2).clamp_min(1e-6)
+        q_valid = valid.any(2)
+        q_loss = self._masked_mean(
+            F.binary_cross_entropy(query.squeeze(-1).clamp(1e-5, 1 - 1e-5),
+                                   q_target, reduction='none'), q_valid)
+        return point_loss + 0.5 * q_loss
+
+    def _loss_dynamic(self, cls_scores, output, cache, refine_pts_flat):
+        """Soft dynamic geometry loss with bidirectional nearest-neighbor coverage."""
+        pred_role = output['role_pred'].reshape(cls_scores.shape[0], -1)
+        total, count = refine_pts_flat.new_zeros(()), refine_pts_flat.new_zeros(())
+        for b, gt_points in enumerate(cache.get('gt_points_list', [])):
+            if gt_points.numel() == 0:
+                continue
+            gt_role = cache['gt_role_target_list'][b]
+            gt_valid = cache['gt_role_valid_list'][b]
+            dynamic = gt_valid & (gt_role > 0)
+            if not dynamic.any():
+                continue
+            dynamic_points = gt_points[dynamic]
+            nearest = self._chunked_nearest_indices(
+                refine_pts_flat[b], dynamic_points)
+            error = (refine_pts_flat[b] - dynamic_points[nearest]).abs().mean(-1)
+            weight = pred_role[b] * gt_role[dynamic][nearest]
+            total = total + (error * weight).sum()
+            count = count + weight.sum()
+        return total / count.clamp_min(1.0)
+
+    def loss_future(self, voxel_semantics, all_refine_pts, all_cls_scores,
+                    points_mask, dsqe_outputs=None, match_cache_list=None):
         # voxelsemantics [B, X200, Y200, Z16] unocuupied=17
 
         gt_points_list, gt_labels_list = [],  []
@@ -431,6 +603,25 @@ class OPUSHead(BaseModule):
             loss_dict[f'fu{time_stamp}.loss_cls'] = loss_cls_i * (not self.pretrain)
             loss_dict[f'fu{time_stamp}.loss_pts'] = loss_pts_i * (not self.pretrain)
             time_stamp += 1
+        if dsqe_outputs is not None:
+            for index, output in enumerate(dsqe_outputs):
+                prefix = 'fu{}'.format(index + 1)
+                zero = all_refine_pts[index].sum() * 0
+                cache = (None if match_cache_list is None else
+                         match_cache_list[index])
+                if cache is None:
+                    cache = self.build_future_match_cache(
+                        all_refine_pts[index], voxel_semantics[index])
+                role_logits = output.get('role_logits')
+                if role_logits is not None:
+                    target = cache['role_target'].to(role_logits.dtype)
+                    valid = cache['role_valid'].to(role_logits.dtype)
+                    role_loss = F.binary_cross_entropy_with_logits(
+                        role_logits.squeeze(-1), target, reduction='none')
+                    loss_dict[prefix + '.loss_role'] = (
+                        role_loss * valid).sum() / valid.sum().clamp_min(1)
+                else:
+                    loss_dict[prefix + '.loss_role'] = zero
         return loss_dict
 
     def loss_pretrain(self,voxel_semantic,temporal_semantics,temporal2ego, pred_dicts):

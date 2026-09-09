@@ -104,6 +104,8 @@ img_norm_cfg = dict(
 
 model = dict(
     type='SparseWorld4DTraj',
+    dsqe_mode='baseline',
+    dsqe_cfg=dict(enabled=False, mode='baseline'),
     final_softplus=True,
     out_dim=256,
     use_grid_mask=False,
