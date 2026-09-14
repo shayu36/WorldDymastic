@@ -59,6 +59,21 @@ class DefaultFormatBundle(object):
                 results[key] = DC([to_tensor(res) for res in results[key]])
             else:
                 results[key] = DC(to_tensor(results[key]))
+
+        # Temporal actor annotations are intentionally ragged: every sample
+        # contains a different number of actors.  Wrapping them without
+        # ``stack=True`` lets the mmcv collate function preserve one tensor
+        # per sample (and therefore works for multi-GPU batches as well).
+        for key in ('temporal_agent_boxes', 'temporal_agent_feats',
+                    'temporal_agent_labels'):
+            if key not in results:
+                continue
+            value = results[key]
+            if isinstance(value, (list, tuple)):
+                value = [to_tensor(item) for item in value]
+            else:
+                value = to_tensor(value)
+            results[key] = DC(value, stack=False)
         if 'gt_bboxes_3d' in results:
             if isinstance(results['gt_bboxes_3d'], BaseInstance3DBoxes):
                 results['gt_bboxes_3d'] = DC(

@@ -47,41 +47,13 @@ class DSQEDualEvolution(nn.Module):
         return head(feat).reshape(feat.shape[0], feat.shape[1], self.num_points, 3).tanh() * scale
 
     def forward(self, query_feat, carried_points, new_points_t0, ego_feat,
-                query_role, point_role, next_to_current, next_to_t0, ego_warp,
-                base_points=None):
+                query_role, next_to_current, next_to_t0, ego_warp):
         nc = carried_points.shape[1]
         carried_feat, new_feat = query_feat[:, :nc], query_feat[:, nc:]
         carried_prior = ego_warp.current_to_next(carried_points, next_to_current)
         new_prior = ego_warp.t0_to_next(new_points_t0, next_to_t0)
         carried_metric = decode_points(carried_prior, self.pc_range)
         new_metric = decode_points(new_prior, self.pc_range)
-        if base_points is not None:
-            # Compatibility adapter for archived residual experiments.  The
-            # PreSCF detector never passes ``base_points``; this branch is
-            # intentionally isolated and cannot become a second recursive
-            # carrier.
-            base_metric = decode_points(base_points, self.pc_range)
-            dynamic_delta = self._residual(
-                self.dynamic_residual_head, query_feat, self.residual_scale)
-            dynamic_delta = dynamic_delta.clone(); dynamic_delta[..., 2] = 0
-            static_delta = self._residual(
-                self.static_residual_head, query_feat, self.residual_scale) * self.static_alpha
-            residual_delta = point_role.to(base_metric.dtype) * dynamic_delta + \
-                (1 - point_role.to(base_metric.dtype)) * static_delta
-            evolved_metric = base_metric + residual_delta
-            return dict(points=encode_points(evolved_metric, self.pc_range),
-                        points_metric=evolved_metric,
-                        base_points_metric=base_metric,
-                        carried_prior_metric=carried_metric,
-                        new_prior_metric=new_metric,
-                        static_points_metric=base_metric + static_delta,
-                        dynamic_points_metric=base_metric + dynamic_delta,
-                        query_motion=carried_metric.new_zeros(
-                            carried_metric.shape[:2] + (3,)),
-                        static_residual=static_delta,
-                        dynamic_residual=dynamic_delta,
-                        new_residual=residual_delta,
-                        residual_delta=residual_delta)
         if nc:
             center = carried_metric.mean(2)
             ego = ego_feat.expand(-1, nc, -1)
@@ -92,7 +64,10 @@ class DSQEDualEvolution(nn.Module):
             dynamic_delta = dynamic_delta.clone(); dynamic_delta[..., 2] = 0
             static_points = carried_metric + self.static_alpha * static_delta
             dynamic_points = carried_metric + motion.unsqueeze(2) + dynamic_delta
-            gate = point_role[:, :nc].clamp(0, 1)
+            # One Query owns all of its refine points.  Use the pooled Query
+            # role rho for the D/S state mixture; point roles remain available
+            # for supervision and joint role correction.
+            gate = query_role[:, :nc].clamp(0, 1).unsqueeze(2)
             carried_evolved = (1 - gate) * static_points + gate * dynamic_points
         else:
             motion = carried_metric.new_zeros(carried_metric.shape[:2] + (3,))
@@ -108,9 +83,13 @@ class DSQEDualEvolution(nn.Module):
             new_delta = new_metric.new_zeros(new_metric.shape)
             new_evolved = new_metric
         points_metric = torch.cat([carried_evolved, new_evolved], 1)
+        query_motion = torch.cat([
+            motion,
+            motion.new_zeros(motion.shape[0], new_feat.shape[1], 3)
+        ], dim=1)
         return dict(points=encode_points(points_metric, self.pc_range), points_metric=points_metric,
                     carried_prior_metric=carried_metric, new_prior_metric=new_metric,
                     static_points_metric=torch.cat([static_points, new_metric], 1),
                     dynamic_points_metric=torch.cat([dynamic_points, new_metric], 1),
-                    query_motion=motion, static_residual=static_delta,
+                    query_motion=query_motion, static_residual=static_delta,
                     dynamic_residual=dynamic_delta, new_residual=new_delta)

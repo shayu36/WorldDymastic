@@ -92,6 +92,9 @@ class DSQEEgoWarp(nn.Module):
     def transform_metric(points, transform):
         rot = transform[..., :3, :3]
         trans = transform[..., :3, 3]
+        # Homogeneous transforms follow the usual column convention while
+        # points are stored with a trailing coordinate dimension.  The
+        # ``bij`` einsum layout below is equivalent to ``points @ R.T``.
         out = torch.einsum('b...j,bij->b...i', points, rot)
         view = [trans.shape[0]] + [1] * (points.ndim - 2) + [3]
         return out + trans.reshape(view)

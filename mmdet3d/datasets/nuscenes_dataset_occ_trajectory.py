@@ -434,6 +434,8 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         else:
             mask = ego_infos['num_lidar_pts'] > 0
         gt_bboxes_3d = ego_infos['gt_boxes'][mask]
+        gt_names_3d = np.asarray(ego_infos.get('gt_names',
+                                               [''] * len(ego_infos['gt_boxes'])))[mask]
         # gt_names_3d = ego_infos['gt_names'][mask]
         if self.with_velocity:
             gt_velocity = ego_infos['gt_velocity'][mask]
@@ -441,6 +443,12 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
         if self.with_attr:
+            # ``gt_agent_fut_trajs`` follows the nuScenes/OccWorld convention:
+            # each pair is the actor displacement at that future horizon
+            # relative to the current ego frame (absolute-in-horizon, not a
+            # sequence of adjacent increments).  Keep the values untouched
+            # here; PreSCF selects the requested horizon when constructing
+            # role targets.
             gt_fut_trajs = ego_infos['gt_agent_fut_trajs'][mask]
             gt_fut_masks = ego_infos['gt_agent_fut_masks'][mask]
             gt_fut_goal = ego_infos['gt_agent_fut_goal'][mask]
@@ -449,12 +457,26 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             attr_labels = np.concatenate(
                 [gt_fut_trajs, gt_fut_masks, gt_fut_goal[..., None], gt_lcf_feat, gt_fut_yaw], axis=-1
             ).astype(np.float32)
+        else:
+            attr_labels = np.zeros((gt_bboxes_3d.shape[0], 0), dtype=np.float32)
         # gt_bboxes_3d = LiDARInstance3DBoxes(
         #     gt_bboxes_3d,
         #     box_dim=gt_bboxes_3d.shape[-1],
         #     origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
         input_dict['temporal_agent_boxes'] = torch.tensor(gt_bboxes_3d)
         input_dict['temporal_agent_feats'] = torch.tensor(attr_labels)
+        # Occupancy labels use a different ordering from NuScenes detection
+        # labels.  Keep the mapping explicit so role supervision can reject
+        # ``others`` instead of treating every non-static class as dynamic.
+        occ_label_map = {
+            'car': 4, 'truck': 10, 'construction_vehicle': 5,
+            'bus': 3, 'trailer': 9, 'barrier': 1,
+            'motorcycle': 6, 'bicycle': 2, 'pedestrian': 7,
+            'traffic_cone': 8,
+        }
+        input_dict['temporal_agent_labels'] = torch.tensor(
+            [occ_label_map.get(str(name), -1) for name in gt_names_3d],
+            dtype=torch.long)
 
         # generate rays for rendering supervision
         if self.use_rays:
@@ -477,6 +499,7 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         input_dict['temporal_ego_states'] = dict()
         input_dict['temporal_ego2global'] = dict()
         input_dict['temporal2ego'] = dict()
+        input_dict['temporal_adjacent2ego'] = dict()
         curr_scene = self.data_infos[index]['scene_name']
         for ego_interval in ego_intervals:
             info = self.data_infos[index + ego_interval]
@@ -504,6 +527,16 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             input_dict['temporal2ego'][ego_interval] = np.matmul(
                 np.linalg.inv(input_dict['ego2global']),
                 future_ego2global).astype(np.float32)
+            # ``temporal2ego`` is cumulative T(E_k -> E_0).  PreSCF needs
+            # adjacent transforms T(E_{k+1} -> E_k); expose those explicitly
+            # while retaining the legacy cumulative field for BaseLine loss.
+            if ego_interval == 0:
+                previous = np.eye(4, dtype=np.float32)
+            else:
+                previous = input_dict['temporal2ego'][ego_interval - 1]
+            current = input_dict['temporal2ego'][ego_interval]
+            input_dict['temporal_adjacent2ego'][ego_interval] = (
+                np.linalg.inv(previous) @ current).astype(np.float32)
             input_dict['temporal_ego2global'][ego_interval] = \
                 future_ego2global
         return input_dict

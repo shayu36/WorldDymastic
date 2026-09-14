@@ -196,6 +196,7 @@ class SparseWorld4DTraj(OPUS):
             new_residual_scale=cfg.get('new_residual_scale', 1.0))
         self.dual_interaction = DSQEDualInteraction(
             self.out_dim, num_heads=cfg.get('num_heads', 8),
+            local_k=cfg.get('local_k', 16),
             dropout=cfg.get('dropout', drop_out),
             dynamic_from_static_init=cfg.get('lambda_DS', 1.0),
             static_from_dynamic_init=cfg.get('lambda_SD', 0.25))
@@ -204,32 +205,62 @@ class SparseWorld4DTraj(OPUS):
         self.source_embedding = nn.Embedding(2, self.out_dim)
         self.activation_embedding = nn.Embedding(
             self.num_fu_frames + 1, self.out_dim)
-        self.prescf_yaw_head = nn.Sequential(
+        self.prescf_ego_pose_head = nn.Sequential(
             nn.Linear(self.out_dim, self.out_dim), nn.ReLU(inplace=True),
-            nn.Linear(self.out_dim, 2))
-        self.prescf_teacher_forcing = float(cfg.get('teacher_forcing', 0.0))
+            nn.Linear(self.out_dim, 4))
+        # Role and ego routing have separate curricula.  Keep the historical
+        # ``teacher_forcing`` key as a backwards-compatible fallback, but do
+        # not let a pose curriculum silently control role labels (or vice
+        # versa).
+        legacy_tf = float(cfg.get('teacher_forcing', 0.0))
+        self.prescf_role_teacher_forcing = float(
+            cfg.get('role_teacher_forcing', legacy_tf))
+        self.prescf_ego_teacher_forcing = float(
+            cfg.get('ego_teacher_forcing', legacy_tf))
+        self.prescf_teacher_forcing = self.prescf_ego_teacher_forcing
         self.prescf_loss_weights = dict(
             role=float(cfg.get('lambda_role', 0.1)),
             ego=float(cfg.get('lambda_ego', 0.1)),
             static=float(cfg.get('lambda_static', 0.01)),
             dynamic=float(cfg.get('lambda_dynamic', 0.01)),
             smooth=float(cfg.get('lambda_smooth', 0.01)))
-        nn.init.zeros_(self.prescf_yaw_head[-1].weight)
+        nn.init.zeros_(self.prescf_ego_pose_head[-1].weight)
         with torch.no_grad():
-            self.prescf_yaw_head[-1].bias.copy_(
-                torch.tensor([0.0, 1.0]))
+            self.prescf_ego_pose_head[-1].bias.copy_(
+                torch.tensor([0.0, 0.0, 0.0, 1.0]))
+        # Snapshot for reducing only rank-local TASS count increments.  It is
+        # intentionally non-persistent and initialized after checkpoint load
+        # on the first distributed forward.
+        self._prescf_synced_tass_counts = None
         self._configure_prescf_stage()
 
     def _configure_prescf_stage(self):
         """Freeze the perception/TASS anchor during the initial PreSCF stage."""
         cfg = self.dsqe_cfg
+        self._prescf_tass_frozen = bool(cfg.get('freeze_tass', False))
+        self._prescf_unfreeze_tass_epoch = int(
+            cfg.get('stage3_start_epoch', 10 ** 9)) if cfg.get(
+                'unfreeze_tass', True) else 10 ** 9
+        self._prescf_unfreeze_tass_layers = int(
+            cfg.get('unfreeze_tass_layers', 2))
         if cfg.get('freeze_backbone', False):
             for module in (getattr(self, 'img_backbone', None),
                            getattr(self, 'img_neck', None)):
                 if module is not None:
                     for parameter in module.parameters():
                         parameter.requires_grad = False
-        if cfg.get('freeze_tass', False):
+        if cfg.get('freeze_baseline_heads', True):
+            # These modules belong to the established BaseLine current/SCF
+            # and planning path.  PreSCF reads their representations but does
+            # not alter their weights during Stages 1/2.
+            baseline_modules = (
+                self.plan_head, self.ego_cross_attn, self.position_encoder,
+                self.reg_branch, self.vel_branch, self.cls_branch,
+                self.points_scale_branch, self.traj_head)
+            for module in baseline_modules:
+                for parameter in module.parameters():
+                    parameter.requires_grad = False
+        if self._prescf_tass_frozen:
             # OPUSHead owns RAP/TASS and the initial Query bank.  Keeping it
             # fixed makes the BaseLine and PreSCF comparisons reproducible.
             for parameter in self.pts_bbox_head.parameters():
@@ -239,6 +270,54 @@ class SparseWorld4DTraj(OPUS):
         self.pts_bbox_head.init_weights()
         bias_init = bias_init_with_prob(0.01)
         nn.init.constant_(self.cls_branch[-1].bias, bias_init)
+        # Warm-start the absolute PreSCF semantic head from the trained
+        # BaseLine classifier.  The BaseLine classifier emits one 17-way
+        # vector per refine point; averaging those point-specific projections
+        # gives the new point-conditioned head a sensible initial prior.
+        if self.dsqe_mode == 'prescf' and hasattr(self, 'joint_refine'):
+            source = self.cls_branch[-1]
+            target = self.joint_refine.semantic_head
+            with torch.no_grad():
+                if source.weight.shape[0] % target.out_features == 0 and \
+                        source.weight.shape[1] == target.in_features:
+                    weights = source.weight.reshape(
+                        -1, target.out_features, target.in_features).mean(0)
+                    bias = source.bias.reshape(
+                        -1, target.out_features).mean(0)
+                    target.weight.copy_(weights)
+                    target.bias.copy_(bias)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata,
+                              strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        """Migrate a BaseLine classifier into a missing PreSCF semantic head.
+
+        ``init_weights`` runs before the epoch-56 checkpoint is loaded, so a
+        one-time copy there would only copy random initialization.  Injecting
+        the averaged point-specific BaseLine projection at state-dict load
+        time makes warm-starting work for real BaseLine checkpoints while
+        leaving native PreSCF checkpoints untouched.
+        """
+        if self.dsqe_mode == 'prescf' and hasattr(self, 'joint_refine'):
+            target_weight = prefix + 'joint_refine.semantic_head.weight'
+            target_bias = prefix + 'joint_refine.semantic_head.bias'
+            source_index = len(self.cls_branch) - 1
+            source_weight = prefix + 'cls_branch.{}.weight'.format(source_index)
+            source_bias = prefix + 'cls_branch.{}.bias'.format(source_index)
+            if target_weight not in state_dict and source_weight in state_dict:
+                weight = state_dict[source_weight]
+                classes = self.joint_refine.semantic_head.out_features
+                if weight.shape[0] % classes == 0:
+                    state_dict[target_weight] = weight.reshape(
+                        -1, classes, weight.shape[-1]).mean(0)
+            if target_bias not in state_dict and source_bias in state_dict:
+                bias = state_dict[source_bias]
+                classes = self.joint_refine.semantic_head.out_features
+                if bias.shape[0] % classes == 0:
+                    state_dict[target_bias] = bias.reshape(-1, classes).mean(0)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs)
 
     def set_epoch(self, epoch):
         self.curr_epoch = epoch
@@ -247,15 +326,49 @@ class SparseWorld4DTraj(OPUS):
                                           self.finetune_epoch))
             end = int(self.dsqe_cfg.get('teacher_forcing_end_epoch',
                                         start + 12))
-            initial = float(self.dsqe_cfg.get('teacher_forcing', 0.0))
+            role_initial = float(self.dsqe_cfg.get(
+                'role_teacher_forcing',
+                self.dsqe_cfg.get('teacher_forcing', 0.0)))
+            ego_initial = float(self.dsqe_cfg.get(
+                'ego_teacher_forcing',
+                self.dsqe_cfg.get('teacher_forcing', 0.0)))
             if epoch <= start:
-                self.prescf_teacher_forcing = initial
+                self.prescf_role_teacher_forcing = role_initial
+                self.prescf_ego_teacher_forcing = ego_initial
             elif epoch >= end:
-                self.prescf_teacher_forcing = 0.0
+                self.prescf_role_teacher_forcing = 0.0
+                self.prescf_ego_teacher_forcing = 0.0
             else:
-                self.prescf_teacher_forcing = initial * (
-                    1.0 - (epoch - start) / max(end - start, 1))
-        if epoch<self.finetune_epoch:
+                decay = 1.0 - (epoch - start) / max(end - start, 1)
+                self.prescf_role_teacher_forcing = role_initial * decay
+                self.prescf_ego_teacher_forcing = ego_initial * decay
+            self.prescf_teacher_forcing = self.prescf_ego_teacher_forcing
+            # Stage 3 optionally unfreezes only the final TASS/SCF decoder
+            # layers, keeping the BaseLine anchor stable earlier in training.
+            if self._prescf_tass_frozen and epoch >= self._prescf_unfreeze_tass_epoch:
+                layers = getattr(getattr(self.pts_bbox_head, 'transformer', None),
+                                 'decoder', None)
+                layers = getattr(layers, 'decoder_layers', None)
+                if layers is not None:
+                    for layer in list(layers)[-self._prescf_unfreeze_tass_layers:]:
+                        for parameter in layer.parameters():
+                            parameter.requires_grad = True
+        if self.dsqe_mode == 'prescf':
+            # PreSCF is initialized from the finished epoch-56 BaseLine.  Its
+            # epoch 0 is already a future-state fine-tuning stage; inheriting
+            # the historical BaseLine ``pretrain`` flag would multiply every
+            # future occupancy loss by zero and leave the absolute semantic
+            # head without gradients.
+            self.pretrain = False
+            self.pts_bbox_head.pretrain = False
+            self._synchronize_tass_state(self)
+            stamps = self.pts_bbox_head.num_stamps_all.float()
+            stamps = stamps / stamps.sum(-1, keepdim=True).clamp_min(1e-6)
+            self.pts_bbox_head.ind_stamps_all = get_matched_inds(
+                stamps, [self.num_query] + self.num_fu_query)
+            self._synchronize_tass_state(self)
+            self.pts_bbox_head.reset_mask()
+        elif epoch<self.finetune_epoch:
             self.pretrain = True
             self.pts_bbox_head.pretrain = True
             if getattr(self.pts_bbox_head, 'num_stamps_all', None) is not None:
@@ -306,6 +419,8 @@ class SparseWorld4DTraj(OPUS):
 
     @staticmethod
     def _to_batch_tensor(value, device, dtype):
+        if hasattr(value, 'data') and not torch.is_tensor(value):
+            value = value.data
         if torch.is_tensor(value):
             return value.to(device=device, dtype=dtype)
         if isinstance(value, (list, tuple)):
@@ -314,6 +429,8 @@ class SparseWorld4DTraj(OPUS):
 
     @staticmethod
     def _to_batch_sequence(value, device, dtype):
+        if hasattr(value, 'data') and not torch.is_tensor(value):
+            value = value.data
         if isinstance(value, (list, tuple)):
             return [SparseWorld4DTraj._to_batch_tensor(item, device, dtype)
                     for item in value]
@@ -328,14 +445,21 @@ class SparseWorld4DTraj(OPUS):
         head = model.pts_bbox_head
         if not dist.is_available() or not dist.is_initialized():
             return
-        reference_num = head.num_stamps_all.clone()
-        reference_ind = head.ind_stamps_all.clone()
-        dist.broadcast(reference_num, src=0)
-        dist.broadcast(reference_ind, src=0)
-        if not torch.equal(head.num_stamps_all, reference_num):
-            raise RuntimeError('num_stamps_all mismatch across ranks')
-        if not torch.equal(head.ind_stamps_all, reference_ind):
-            raise RuntimeError('ind_stamps_all mismatch across ranks')
+        previous = getattr(model, '_prescf_synced_tass_counts', None)
+        if previous is None or previous.shape != head.num_stamps_all.shape or \
+                previous.device != head.num_stamps_all.device:
+            # This also handles checkpoint load: the persisted history is
+            # broadcast once, rather than summed once per rank.
+            dist.broadcast(head.num_stamps_all, src=0)
+        else:
+            delta = (head.num_stamps_all - previous).to(torch.float64)
+            dist.all_reduce(delta, op=dist.ReduceOp.SUM)
+            synchronized = previous.to(delta.dtype) + delta
+            head.num_stamps_all.copy_(
+                synchronized.round().to(head.num_stamps_all.dtype))
+        model._prescf_synced_tass_counts = head.num_stamps_all.clone()
+        if getattr(head, 'ind_stamps_all', None) is not None:
+            dist.broadcast(head.ind_stamps_all, src=0)
 
     def _ensure_tass_state(self):
         head = self.pts_bbox_head
@@ -350,28 +474,73 @@ class SparseWorld4DTraj(OPUS):
             self._synchronize_tass_state(self)
 
     def _build_role_metadata(self, kwargs, interval, gt_relative_matrices=None):
+        """Build actor role targets in the *future ego frame*.
+
+        The temporal nuScenes cache stores ``gt_agent_fut_trajs`` as the
+        displacement at each horizon relative to the current ego frame
+        (``E_0``), rather than as increments between consecutive horizons.
+        We therefore select the displacement at ``interval`` directly and
+        transform the resulting actor centre with ``T(E_0 -> E_interval)``.
+        Older/private caches that contain adjacent increments can opt into the
+        legacy accumulation behaviour with
+        ``dsqe_cfg.role_trajectory_mode='increment'``.
+        """
         boxes = kwargs.get('temporal_agent_boxes')
         feats = kwargs.get('temporal_agent_feats')
+        labels = kwargs.get('temporal_agent_labels')
         if boxes is None:
             return None
+        if hasattr(boxes, 'data') and not torch.is_tensor(boxes):
+            boxes = boxes.data
+        if hasattr(feats, 'data') and not torch.is_tensor(feats):
+            feats = feats.data
+        if hasattr(labels, 'data') and not torch.is_tensor(labels):
+            labels = labels.data
         device = (gt_relative_matrices.device if torch.is_tensor(
             gt_relative_matrices) else (boxes.device if torch.is_tensor(boxes)
                                          else torch.device('cpu')))
         box_list = self._to_batch_sequence(boxes, device, torch.float32)
         feat_list = None if feats is None else self._to_batch_sequence(
             feats, device, torch.float32)
+        label_list = None if labels is None else self._to_batch_sequence(
+            labels, device, torch.long)
+        if (torch.is_tensor(labels) and labels.ndim >= 2 and
+                labels.shape[0] == len(box_list) and len(box_list) > 1):
+            label_list = [labels[index].to(device=device, dtype=torch.long)
+                          for index in range(labels.shape[0])]
+        elif (torch.is_tensor(labels) and labels.ndim == 2 and
+              len(box_list) == 1 and labels.shape[0] == 1):
+            label_list = [labels[0].to(device=device, dtype=torch.long)]
         output = []
         dt = float(self.dsqe_cfg.get('role_frame_dt', 0.5))
-        threshold = float(self.dsqe_cfg.get('role_speed_threshold', 0.5))
-        temperature = float(self.dsqe_cfg.get('role_speed_temperature', 0.5))
+        inflation = float(self.dsqe_cfg.get('role_box_inflation', 0.5))
+        trajectory_mode = str(self.dsqe_cfg.get(
+            'role_trajectory_mode', 'absolute')).lower()
+        if trajectory_mode not in ('absolute', 'increment', 'increments'):
+            raise ValueError(
+                'role_trajectory_mode must be absolute or increment, got {}'.format(
+                    trajectory_mode))
+        dynamic_ids = set(int(x) for x in self.dynamic_class_ids)
+        adjacent = self._build_adjacent_ego_targets(
+            kwargs, 1 if not box_list else len(box_list), interval,
+            device, torch.float32)
+        cumulative = self.ego_warp.identity(
+            len(box_list), device, torch.float32)
+        for step in range(min(interval, len(adjacent))):
+            cumulative = self.ego_warp.compose(cumulative, adjacent[step])
+        to_future = self.ego_warp.inverse(cumulative)
         for b, current in enumerate(box_list):
             if current.ndim == 1:
                 current = current.unsqueeze(0)
             centers = current[:, :3]
-            future_centers = centers.clone()
-            speed = current.new_zeros(centers.shape[0])
-            if current.shape[-1] >= 9:
-                speed = current[:, 7:9].norm(dim=-1)
+            num_agents = centers.shape[0]
+            # The stored actor future trajectory is indexed by horizon and is
+            # expressed in E_0.  ``increment`` remains available for caches
+            # generated by older private preprocessing scripts.
+            displacement = current.new_zeros(num_agents, 2)
+            yaw_delta = current.new_zeros(num_agents)
+            future_valid = torch.ones(num_agents, dtype=torch.bool,
+                                       device=device)
             if feat_list is not None and b < len(feat_list):
                 agent_feat = feat_list[b]
                 if agent_feat.ndim == 1:
@@ -382,41 +551,134 @@ class SparseWorld4DTraj(OPUS):
                         -1, self.num_fu_frames, 2)
                     step = max(0, min(interval - 1,
                                       self.num_fu_frames - 1))
-                    displacement = trajectory[:, step]
-                    speed = displacement.norm(-1) / max(dt, 1e-3)
-                    if interval > 0:
-                        future_centers[:, :2] += displacement
-            valid = torch.ones(centers.shape[0], device=device, dtype=torch.bool)
+                    n = min(num_agents, trajectory.shape[0])
+                    if n:
+                        if trajectory_mode == 'absolute':
+                            displacement[:n] = trajectory[:n, step]
+                        else:
+                            displacement[:n] = trajectory[:n, :step + 1].sum(1)
+                    mask_start = dims
+                    mask_end = mask_start + self.num_fu_frames
+                    if interval > 0 and agent_feat.shape[-1] >= mask_end:
+                        mask_values = agent_feat[
+                            :n, mask_start:mask_start + self.num_fu_frames]
+                        # Validity is defined at the requested horizon.  An
+                        # actor that is absent at an earlier horizon cannot be
+                        # revived by a later one in standard nuScenes data,
+                        # but selecting the target slot is the correct
+                        # interpretation for custom ragged caches as well.
+                        future_valid[:n] = mask_values[:, step] > 0.5
+                    yaw_start = agent_feat.shape[-1] - self.num_fu_frames
+                    if interval > 0 and yaw_start >= mask_end and n:
+                        yaw_values = agent_feat[
+                            :n, yaw_start:yaw_start + self.num_fu_frames]
+                        yaw_values = torch.atan2(yaw_values.sin(),
+                                                yaw_values.cos())
+                        if trajectory_mode == 'absolute':
+                            yaw_delta[:n] = yaw_values[:, step]
+                        else:
+                            yaw_delta[:n] = yaw_values[:, :step + 1].sum(1)
+            future_centers_t0 = centers.clone()
+            if interval > 0 and displacement.shape[0] == num_agents:
+                future_centers_t0[:, :2] += displacement
+            future_centers = self.ego_warp.transform_metric(
+                future_centers_t0.unsqueeze(0).unsqueeze(2),
+                to_future[b:b + 1])[0, :, 0]
+            transform_yaw = torch.atan2(to_future[b, 1, 0],
+                                        to_future[b, 0, 0])
+            future_yaw = (current[:, 6] if current.shape[-1] >= 7 else
+                          centers.new_zeros(num_agents)) + yaw_delta + transform_yaw
             if current.shape[-1] >= 6:
-                radius = 0.5 * current[:, 3:5].abs().square().sum(-1).sqrt()
+                # ``traj_info`` is produced from the native nuScenes boxes,
+                # whose size tuple is ``(w, l, h)``.  Role matching operates
+                # in an ego-frame box convention with the x axis along the
+                # box length, so make the ordering explicit instead of
+                # silently swapping an actor's footprint axes.  Projects
+                # that already converted their cache can opt into ``lhw``.
+                raw_dims = current[:, 3:6].abs()
+                dims_order = str(self.dsqe_cfg.get(
+                    'role_box_dims_order', 'wlh')).lower()
+                if dims_order == 'wlh':
+                    dims = raw_dims[:, [1, 0, 2]]
+                elif dims_order in ('lhw', 'lwh'):
+                    dims = raw_dims
+                else:
+                    raise ValueError(
+                        'role_box_dims_order must be wlh or lhw/lwh, got {}'.format(
+                            dims_order))
+                radius = 0.5 * dims[:, :2].square().sum(-1).sqrt() + inflation
             else:
-                radius = centers.new_ones(centers.shape[0])
+                dims = centers.new_ones(num_agents, 3)
+                radius = centers.new_full((num_agents,), 1.0 + inflation)
+            actor_labels = None
+            if label_list is not None and b < len(label_list):
+                actor_labels = label_list[b].reshape(-1)[:num_agents]
+                if actor_labels.numel() != num_agents:
+                    actor_labels = None
+            if actor_labels is not None:
+                known = actor_labels >= 0
+                actor_role = torch.zeros(num_agents, device=device,
+                                         dtype=torch.float32)
+                actor_role[torch.tensor(
+                    [int(x) in dynamic_ids for x in actor_labels.tolist()],
+                    device=device, dtype=torch.bool)] = 1.0
+                valid = future_valid & known
+            else:
+                # Fallback for old caches without labels: velocity is only a
+                # weak prior, never a class-0/``others`` dynamic label.
+                speed = (displacement.norm(-1) / max(interval * dt, 1e-3)
+                         if interval > 0 else displacement.new_zeros(num_agents))
+                actor_role = (speed > float(self.dsqe_cfg.get(
+                    'role_speed_threshold', 0.5))).float()
+                valid = future_valid
             output.append(dict(
                 centers=future_centers, radius=radius.clamp_min(0.5),
-                role=torch.sigmoid((speed - threshold) /
-                                   max(temperature, 1e-3)),
-                valid=valid,
-                dims=(current[:, 3:6] if current.shape[-1] >= 6 else
-                      centers.new_ones(centers.shape[0], 3)),
-                yaw=(current[:, 6] if current.shape[-1] >= 7 else
-                     centers.new_zeros(centers.shape[0])))
+                role=actor_role, valid=valid,
+                labels=(actor_labels if actor_labels is not None else
+                        torch.full((num_agents,), -1, device=device,
+                                   dtype=torch.long)),
+                dims=dims, yaw=future_yaw)
             )
         return output
 
     @staticmethod
-    def _refine_semantics(model, base_semantics, next_feat,
-                          baseline_feat=None):
-        """Compatibility helper for archived residual diagnostics.
-
-        PreSCF does not call this method; its semantic logits are produced by
-        ``DSQEJointRefine.semantic_head`` from the current state.
-        """
-        cfg = getattr(model, 'dsqe_cfg', {}) or {}
-        head = getattr(model, 'semantic_correction_head', None)
-        if head is None:
-            return base_semantics, None
-        correction = head(next_feat).reshape_as(base_semantics)
-        return base_semantics + float(cfg.get('semantic_residual_scale', 1.0)) * correction, correction
+    def _role_targets_from_metadata(points_metric, metadata):
+        """Match query points to actor footprints for GT role forcing."""
+        bsz, queries, num_points = points_metric.shape[:3]
+        target = points_metric.new_zeros(bsz, queries, num_points, 1)
+        valid = torch.zeros(bsz, queries, num_points, 1,
+                            device=points_metric.device, dtype=torch.bool)
+        if metadata is None:
+            return target, valid
+        for b in range(min(bsz, len(metadata))):
+            actors = metadata[b]
+            if not actors or actors.get('centers') is None:
+                continue
+            centers = actors['centers'].to(points_metric)
+            if centers.numel() == 0:
+                continue
+            radius = actors['radius'].to(points_metric)
+            role = actors['role'].to(points_metric)
+            actor_valid = actors.get('valid', torch.ones_like(role, dtype=torch.bool))
+            actor_valid = actor_valid.to(points_metric.device).bool()
+            dims = actors.get('dims')
+            yaw = actors.get('yaw')
+            points = points_metric[b].reshape(-1, 3)
+            distance = torch.cdist(points[:, :2], centers[:, :2])
+            nearest, index = distance.min(dim=1)
+            matched = (nearest <= radius[index]) & actor_valid[index]
+            if dims is not None and yaw is not None:
+                dims = dims.to(points_metric).abs()
+                yaw = yaw.to(points_metric)
+                delta = points[:, :2] - centers[index, :2]
+                c, s = yaw[index].cos(), yaw[index].sin()
+                local_x = c * delta[:, 0] + s * delta[:, 1]
+                local_y = -s * delta[:, 0] + c * delta[:, 1]
+                matched &= (local_x.abs() <= dims[index, 0] * 0.5 + 0.5)
+                matched &= (local_y.abs() <= dims[index, 1] * 0.5 + 0.5)
+            target[b].reshape(-1, 1)[matched] = role[index[matched], None]
+            valid[b].reshape(-1, 1)[matched] = True
+        return target, valid
 
     def loss_traj(self, pred_traj, gt_traj, ego_interval):
         loss_dict = dict()
@@ -438,25 +700,119 @@ class SparseWorld4DTraj(OPUS):
             points.flatten(1, 2), offset, matrices).reshape_as(points)
         return gt_points[..., 0] >= 0
 
+    def _prescf_foreground_mask(self, points, interval=None, img_metas=None,
+                                kwargs=None):
+        """Return a mask in the already-aligned PreSCF future frame.
+
+        ``_baseline_foreground_mask`` intentionally applies the historical
+        BaseLine ego-trajectory conversion to its input points.  PreSCF
+        points, however, have already been warped into ``E_{t+1}`` by the
+        recursive state transition.  Applying that conversion a second time
+        would mix frames and make the occupancy supervision mask depend on
+        the old residual-path convention.  The encoded point range test is
+        the same fallback used by BaseLine when no trajectory metadata is
+        available, while remaining frame-consistent for every future step.
+        """
+        return points[..., 0] >= 0
+
     @staticmethod
-    def _future_pose_target(kwargs, interval, device, dtype):
-        """Read an optional training-only adjacent ego transform."""
-        sequence = kwargs.get('temporal2ego')
+    def _matrix_value(value, device, dtype, batch_size):
+        """Normalize one collated transform value to ``[B, 4, 4]``."""
+        if hasattr(value, 'data') and not torch.is_tensor(value):
+            value = value.data
+        if isinstance(value, (list, tuple)) and value and all(
+                torch.is_tensor(item) for item in value):
+            value = torch.stack(list(value), dim=0)
+        value = torch.as_tensor(value, device=device, dtype=dtype)
+        if value.ndim == 2:
+            value = value.unsqueeze(0).expand(batch_size, -1, -1)
+        elif value.ndim == 3 and value.shape[0] == 1 and batch_size > 1:
+            value = value.expand(batch_size, -1, -1)
+        if value.ndim != 3 or value.shape[-2:] != (4, 4):
+            raise ValueError('Expected ego transforms with shape [B,4,4], got {}'.format(
+                tuple(value.shape)))
+        if value.shape[0] != batch_size:
+            raise ValueError('Ego transform batch {} does not match batch {}'.format(
+                value.shape[0], batch_size))
+        return value
+
+    @classmethod
+    def _sequence_values(cls, sequence, num_steps, device, dtype, batch_size):
+        """Read collated dict/tensor transform sequences in time order."""
+        values = []
         if sequence is None:
-            return None
-        value = None
+            return values
+        if hasattr(sequence, 'data') and not torch.is_tensor(sequence):
+            sequence = sequence.data
+        # ``stack=False`` DataContainers may arrive as one dict per sample.
+        # Reassemble each time slot along the batch dimension before parsing.
+        if isinstance(sequence, (list, tuple)) and sequence and all(
+                isinstance(item, dict) for item in sequence):
+            for index in range(num_steps):
+                gathered = []
+                for item in sequence:
+                    value = item.get(index, item.get(str(index)))
+                    if value is None:
+                        gathered = []
+                        break
+                    gathered.append(value)
+                if not gathered:
+                    break
+                values.append(cls._matrix_value(gathered, device, dtype,
+                                                batch_size))
+            return values
         if isinstance(sequence, dict):
-            value = sequence.get(interval + 1, sequence.get(interval))
-        elif torch.is_tensor(sequence):
-            if sequence.ndim == 4 and sequence.shape[1] > interval:
-                value = sequence[:, interval]
-            elif sequence.ndim == 3:
-                value = sequence
-        if value is None:
-            return None
-        if isinstance(value, (list, tuple)):
-            value = torch.as_tensor(value)
-        return value.to(device=device, dtype=dtype)
+            for index in range(num_steps):
+                value = sequence.get(index, sequence.get(str(index)))
+                if value is None:
+                    break
+                values.append(cls._matrix_value(value, device, dtype, batch_size))
+        else:
+            tensor = torch.as_tensor(sequence, device=device, dtype=dtype)
+            if tensor.ndim == 4:
+                values = [cls._matrix_value(tensor[:, index], device, dtype,
+                                            batch_size)
+                          for index in range(min(num_steps, tensor.shape[1]))]
+            elif tensor.ndim == 3:
+                values = [cls._matrix_value(tensor, device, dtype, batch_size)]
+        return values
+
+    @classmethod
+    def _build_adjacent_ego_targets(cls, kwargs, batch_size, num_steps,
+                                    device, dtype):
+        """Build ``T(E_{t+1}->E_t)`` from either explicit or cumulative data.
+
+        Dataset ``temporal2ego`` values are cumulative ``T(E_k->E_0)``.  The
+        explicit ``temporal_adjacent2ego`` field is preferred, while the
+        fallback computes the mathematically equivalent adjacent sequence.
+        """
+        explicit = cls._sequence_values(
+            kwargs.get('temporal_adjacent2ego'), num_steps, device, dtype,
+            batch_size)
+        if len(explicit) >= num_steps:
+            return explicit[:num_steps]
+        cumulative = cls._sequence_values(
+            kwargs.get('temporal2ego'), num_steps, device, dtype, batch_size)
+        if not cumulative:
+            return []
+        identity = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).expand(
+            batch_size, -1, -1)
+        adjacent = []
+        previous = identity
+        for current in cumulative[:num_steps]:
+            adjacent.append(torch.matmul(torch.linalg.inv(previous), current))
+            previous = current
+        return adjacent
+
+    @classmethod
+    def _future_pose_target(cls, kwargs, interval, device, dtype,
+                            batch_size=None):
+        """Read one adjacent ego transform, never a cumulative transform."""
+        if batch_size is None:
+            batch_size = 1
+        targets = cls._build_adjacent_ego_targets(
+            kwargs, batch_size, interval + 1, device, dtype)
+        return targets[interval] if len(targets) > interval else None
 
     def _forward_baseline_scf(self, outs, ego_feat, img_metas, kwargs):
         """The unmodified SparseWorld future SCF reference path."""
@@ -544,6 +900,10 @@ class SparseWorld4DTraj(OPUS):
         num_forecast = (self._num_forecast_frames()
                         if hasattr(self, '_num_forecast_frames') else
                         self.num_fu_frames)
+        adjacent_targets = (self._build_adjacent_ego_targets(
+            kwargs, batch_size, num_forecast, state_points.device,
+            state_points.dtype) if self.training else [])
+        previous_motion = None
         for interval in range(num_forecast):
             new_mask = stamps == interval + 1
             num_carried = state_feat.shape[1]
@@ -551,8 +911,13 @@ class SparseWorld4DTraj(OPUS):
             new_points = all_points[:, new_mask]
             new_semantics = all_semantics[:, new_mask]
             num_new = new_feat.shape[1]
+            # New RAP/TASS queries are stored in E_0.  Before routing them
+            # together with carried state, express them in the current ego
+            # frame.  ``cumulative`` is T(E_t -> E_0).
+            new_points_current = self.ego_warp.t0_to_next(
+                new_points, cumulative)
             state_feat = torch.cat([state_feat, new_feat], dim=1)
-            state_points = torch.cat([state_points, new_points], dim=1)
+            state_points = torch.cat([state_points, new_points_current], dim=1)
             state_semantics = torch.cat([state_semantics, new_semantics], dim=1)
             source = state_points.new_zeros(batch_size, num_carried + num_new, 1)
             source[:, :num_carried] = 1
@@ -563,29 +928,62 @@ class SparseWorld4DTraj(OPUS):
             conditioned_feat = state_feat + self.source_embedding(
                 source.squeeze(-1).long()) + self.activation_embedding(activation)
             role_prior = None
-            role_valid = None
+            role_prior_valid = None
             if state_role is not None:
                 role_prior = torch.cat([
                     state_role,
                     state_points.new_zeros(batch_size, num_new,
                                            self.num_refines, 1)
                 ], dim=1)
-                role_valid = torch.cat([
+                role_prior_valid = torch.cat([
                     torch.ones_like(state_role, dtype=torch.bool),
                     torch.zeros(batch_size, num_new, self.num_refines, 1,
                                 device=state_points.device, dtype=torch.bool)
                 ], dim=1)
             teacher_role = None
             teacher_valid = None
-            if self.training and self.prescf_teacher_forcing > 0:
-                teacher_role = self.role_router.semantic_dynamic_prior(
-                    state_semantics).detach()
-                teacher_valid = torch.ones_like(teacher_role, dtype=torch.bool)
+            role_cache = None
+            if self.training:
+                # Routing is conditioned on the current state E_t.  Match
+                # carried points against actors at t (not t+1); applying the
+                # next ego transform here would supervise the wrong frame.
+                metadata = self._build_role_metadata(kwargs, interval)
+                current_semantics = kwargs.get('voxel_semantics_current')
+                if interval > 0:
+                    temporal = kwargs.get('temporal_semantics')
+                    if isinstance(temporal, dict):
+                        current_semantics = temporal.get(
+                            interval, temporal.get(str(interval)))
+                    elif temporal is not None and len(temporal) >= interval:
+                        current_semantics = temporal[interval - 1]
+                    if isinstance(current_semantics, dict):
+                        current_semantics = current_semantics.get(
+                            'voxel_semantics')
+                if current_semantics is not None and hasattr(
+                        self.pts_bbox_head, 'build_role_match_cache'):
+                    role_cache = self.pts_bbox_head.build_role_match_cache(
+                        state_points, current_semantics,
+                        role_metadata=metadata)
+                    role_target = role_cache['role_target'].unsqueeze(-1)
+                    role_target_valid = role_cache['role_valid'].unsqueeze(-1)
+                elif metadata is not None:
+                    role_target, role_target_valid = self._role_targets_from_metadata(
+                        decode_points(state_points, self.pc_range), metadata)
+                    role_cache = dict(role_target=role_target.squeeze(-1),
+                                      role_valid=role_target_valid.squeeze(-1))
+                if role_cache is not None and self.prescf_role_teacher_forcing > 0:
+                    teacher_role = role_target
+                    teacher_valid = role_target_valid.clone()
+                    # New Queries have no reliable temporal identity.  They
+                    # may be supervised by the future occupancy cache, but
+                    # must not inherit a carried Query's GT role teacher.
+                    if num_new and teacher_valid is not None:
+                        teacher_valid[:, num_carried:] = False
             role = self.role_router(
                 conditioned_feat, state_points, state_semantics, source,
-                role_prior=role_prior, role_prior_valid=role_valid,
+                role_prior=role_prior, role_prior_valid=role_prior_valid,
                 teacher_role=teacher_role, teacher_valid=teacher_valid,
-                teacher_forcing_ratio=(self.prescf_teacher_forcing
+                teacher_forcing_ratio=(self.prescf_role_teacher_forcing
                                        if self.training else 0.0))
             query_role = role['query_role']
 
@@ -595,32 +993,39 @@ class SparseWorld4DTraj(OPUS):
                 ego_point, ego_feat, state_points, conditioned_feat)
             pred_traj = self.traj_head(ego_context)
             pred_trajs.append(pred_traj)
-            yaw = F.normalize(self.prescf_yaw_head(ego_context), dim=-1,
-                              eps=1e-6)
-            pose = torch.cat([pred_traj, yaw], dim=-1).squeeze(1)
-            next_to_current = self.ego_warp.pose_to_matrix(pose)
-            gt_pose = self._future_pose_target(
-                kwargs, interval, state_points.device, state_points.dtype)
+            pose_raw = self.prescf_ego_pose_head(ego_context).squeeze(1)
+            yaw = F.normalize(pose_raw[..., 2:4], dim=-1, eps=1e-6)
+            pose = torch.cat([pose_raw[..., :2], yaw], dim=-1)
+            predicted_next_to_current = self.ego_warp.pose_to_matrix(pose)
+            next_to_current = predicted_next_to_current
+            gt_pose = (adjacent_targets[interval]
+                       if self.training and interval < len(adjacent_targets)
+                       else None)
+            teacher_forcing_mask = torch.zeros(
+                batch_size, device=state_points.device, dtype=torch.bool)
             if self.training and gt_pose is not None and \
-                    self.prescf_teacher_forcing > 0:
-                choose_gt = (torch.rand(batch_size, device=state_points.device) <
-                             self.prescf_teacher_forcing)
+                    self.prescf_ego_teacher_forcing > 0:
+                teacher_forcing_mask = (
+                    torch.rand(batch_size, device=state_points.device) <
+                    self.prescf_ego_teacher_forcing)
                 next_to_current = torch.where(
-                    choose_gt[:, None, None], gt_pose, next_to_current)
+                    teacher_forcing_mask[:, None, None], gt_pose,
+                    predicted_next_to_current)
             cumulative = self.ego_warp.compose(cumulative, next_to_current)
 
             evolved = self.dual_evolution(
                 conditioned_feat, state_points[:, :num_carried],
-                all_points[:, new_mask], ego_context, query_role,
-                role['route_role'], next_to_current, cumulative,
+                new_points, ego_context, query_role,
+                next_to_current, cumulative,
                 self.ego_warp)
             interaction = self.dual_interaction(
                 conditioned_feat, query_role, evolved['points_metric'])
             joint = self.joint_refine(
                 conditioned_feat, interaction['dynamic_feat'],
                 interaction['static_feat'], evolved['points_metric'])
-            correction_gate = 0.25 + 0.75 * query_role
-            final_metric = evolved['points_metric'] + correction_gate * joint['point_correction']
+            correction_gate = (0.25 + 0.75 * query_role).unsqueeze(2)
+            final_metric = (evolved['points_metric'] +
+                            correction_gate * joint['point_correction'])
             correction_scale = float(self.dsqe_cfg.get(
                 'role_correction_scale', 0.25))
             corrected_role = (
@@ -630,10 +1035,11 @@ class SparseWorld4DTraj(OPUS):
             corrected_query_role = (
                 role['pool_weights'] * corrected_role).sum(dim=2)
             final_points = encode_points(final_metric, self.pc_range)
-            semantics = joint['semantic_logits']
+            semantics = self.joint_refine.predict_semantics(
+                joint['query_feat'], final_metric)
 
             if self.training:
-                forecast_masks.append(self._baseline_foreground_mask(
+                forecast_masks.append(self._prescf_foreground_mask(
                     final_points, interval, img_metas, kwargs))
             forecast_points.append(final_points)
             forecast_semantics.append(semantics)
@@ -653,25 +1059,34 @@ class SparseWorld4DTraj(OPUS):
                     match_cache = self.pts_bbox_head.build_future_match_cache(
                         final_points, future, role_metadata=metadata)
             match_cache_list.append(match_cache)
-            role_loss = F.binary_cross_entropy(
-                role['role_pred'], role['semantic_prior'].detach())
-            dynamic_loss = evolved['dynamic_residual'].abs().mean()
-            static_loss = evolved['static_residual'].abs().mean()
-            if num_carried:
-                smooth_loss = (final_metric[:, :num_carried] -
-                               evolved['carried_prior_metric']).abs().mean()
+            role_loss = final_metric.new_zeros(())
+            dynamic_loss = final_metric.new_zeros(())
+            static_loss = final_metric.new_zeros(())
+            if previous_motion is not None and num_carried:
+                overlap = min(previous_motion.shape[1],
+                              evolved['query_motion'].shape[1])
+                smooth_loss = (evolved['query_motion'][:, :overlap] -
+                               previous_motion[:, :overlap]).abs().mean()
             else:
                 smooth_loss = final_metric.new_zeros(())
+            previous_motion = evolved['query_motion']
             prescf_outputs.append(dict(
                 role=role, corrected_role=corrected_role,
                 role_logits=role['role_logits'], role_pred=role['role_pred'],
                 query_role=corrected_query_role, query_motion=evolved['query_motion'],
-                predicted_pose=pose, predicted_relative_matrix=next_to_current,
+                predicted_pose=pose,
+                predicted_relative_matrix=predicted_next_to_current,
+                routed_relative_matrix=next_to_current,
+                ego_teacher_forcing_mask=teacher_forcing_mask,
+                gt_pose_target=(gt_pose.detach() if gt_pose is not None else None),
+                input_feat=state_feat, input_points=state_points,
+                input_semantics=state_semantics,
                 points_metric=final_metric, evolved_points_metric=evolved['points_metric'],
                 semantics=semantics, joint_feat=joint['query_feat'],
                 loss_role=role_loss, loss_dynamic=dynamic_loss,
                 loss_static=static_loss, loss_smooth=smooth_loss,
                 num_carried=num_carried, match_cache=match_cache,
+                role_cache=role_cache,
                 pool_weights=role['pool_weights']))
             state_feat, state_points, state_semantics = (
                 joint['query_feat'], final_points, semantics)
@@ -775,6 +1190,7 @@ class SparseWorld4DTraj(OPUS):
         temporal_semantics = kwargs['temporal_semantics']
         B = img.shape[0]
         temporal2ego = kwargs['temporal2ego']
+        kwargs['voxel_semantics_current'] = voxel_semantics
         outputs = self.forward_backbone(img,img_metas,**kwargs)
         cls_score,refine_pts,outs = outputs['cls_score'],outputs['refine_pts'],outputs['outs']
 
@@ -813,28 +1229,49 @@ class SparseWorld4DTraj(OPUS):
         if self.dsqe_mode == 'prescf' and outputs.get('prescf_outputs'):
             for interval, state in enumerate(outputs['prescf_outputs'], 1):
                 cache = state.get('match_cache')
-                role_loss = (self.pts_bbox_head._loss_role(state, cache)
-                             if cache is not None and hasattr(
+                # Role logits drive the transition E_t -> E_(t+1), so their
+                # train target is the resulting future state.  This also
+                # provides direct supervision for newly activated Queries;
+                # current-state GT teacher forcing remains carried-only.
+                role_cache = cache if cache is not None else state.get('role_cache')
+                role_loss = (self.pts_bbox_head._loss_role(state, role_cache)
+                             if role_cache is not None and hasattr(
                                  self.pts_bbox_head, '_loss_role') else
                              state['loss_role'])
                 losses['fu{}.loss_role'.format(interval)] = (
                     self.prescf_loss_weights['role'] * role_loss)
-                if interval - 1 < kwargs['temporal_trajs'].shape[1]:
+                if role_cache is not None and hasattr(self.pts_bbox_head,
+                                                 '_role_metrics'):
+                    for metric_name, metric_value in self.pts_bbox_head._role_metrics(
+                            state, role_cache).items():
+                        losses['fu{}.{}'.format(interval, metric_name)] = metric_value
+                if state.get('gt_pose_target') is not None:
+                    target_pose = self.ego_warp.matrix_to_pose(
+                        state['gt_pose_target'])
                     losses['fu{}.loss_ego'.format(interval)] = (
                         self.prescf_loss_weights['ego'] * F.smooth_l1_loss(
-                            state['predicted_pose'][..., :2],
-                            kwargs['temporal_trajs'][:, interval - 1].to(
+                            state['predicted_pose'],
+                            target_pose.to(
                                 state['predicted_pose'].dtype)))
+                else:
+                    losses['fu{}.loss_ego'.format(interval)] = (
+                        state['predicted_pose'].sum() * 0)
+                refine_metric = decode_points(
+                    forecast_points_list[interval - 1].reshape(
+                        forecast_points_list[interval - 1].shape[0], -1, 3),
+                    self.pc_range)
+                static_loss = (self.pts_bbox_head._loss_static(
+                    state, cache, refine_metric)
+                               if cache is not None and hasattr(
+                                   self.pts_bbox_head, '_loss_static') else
+                               state['loss_static'])
                 losses['fu{}.loss_static'.format(interval)] = (
-                    self.prescf_loss_weights['static'] * state['loss_static'])
+                    self.prescf_loss_weights['static'] * static_loss)
                 losses['fu{}.loss_dynamic'.format(interval)] = (
                     self.prescf_loss_weights['dynamic'] * (
                         self.pts_bbox_head._loss_dynamic(
                             forecast_semantics_list[interval - 1], state,
-                            cache, decode_points(
-                                forecast_points_list[interval - 1].reshape(
-                                    forecast_points_list[interval - 1].shape[0], -1, 3),
-                                self.pc_range).detach())
+                            cache, refine_metric)
                         if cache is not None and hasattr(
                             self.pts_bbox_head, '_loss_dynamic') else
                         state['loss_dynamic']))

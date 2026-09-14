@@ -1,5 +1,12 @@
 # 评估协议
 
+> **状态说明（DSQE-PreSCF）**：本文档中 `DSQE`、`epoch_21/25/30/32` 及其
+> `work_dirs/dsqe-ddp-32-baseline56-b2/` 路径均指仓库早期的
+> **DSQE-Residual/旧 SCF 实验**。这些数字不是当前
+> `sparseworld-traj-prescf.py` 的验证结果，不能用来宣称 PreSCF 优于或劣于
+> BaseLine。当前 PreSCF 需要按本文第 8 节重新生成 checkpoint、预测文件和
+> 1s/2s/3s 指标。
+
 ## 1. 评估对象
 
 主比较包含：
@@ -90,3 +97,33 @@ L2_3s = mean(distance[0:6])
 ## 7. 其他运行的处理
 
 仓库中还保留了 `logs/dsqe-ddp-six-step-v4.log` 等早期 IterBased/短程 smoke 运行。这些运行使用了不同的迭代预算、batch/累积配置或验证入口，不能与本次 `dsqe-ddp-32-baseline56-b2` 的 epoch 21/25/30/32 结果直接横向比较，因此不混入主结果表；相关原始日志仍保留在 `logs/` 目录中。
+
+## 8. 当前 DSQE-PreSCF 的重新评估入口
+
+PreSCF 与历史 residual 实验必须使用独立工作目录。先完成短程训练和
+单卡/双卡 smoke，再运行完整验证：
+
+```bash
+# 训练（默认就是 PreSCF；BASELINE_CKPT 指向 epoch-56 BaseLine）
+BASELINE_CKPT=/data/jxy/projects/ckpts/epoch_56.pth \
+WORK_DIR=work_dirs/dsqe-prescf-32-baseline56-b2 \
+bash tools/train_dsqe_project.sh
+
+# 从某个 PreSCF checkpoint 生成 occupancy/trajectory 预测
+PYTHONPATH="$PWD" /data/jxy/projects/env/bin/python3.9 tools/test.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-prescf.py \
+  --checkpoint work_dirs/dsqe-prescf-32-baseline56-b2/latest.pth \
+  --eval segm
+
+# 与固定 BaseLine 预测按相同 token/1s-2s-3s 口径比较
+/data/jxy/projects/env/bin/python3.9 tools/compare_temporal_eval.py \
+  --baseline-log /data/jxy/projects/work_dirs/sparseworld-traj-memory-only/eval_epoch56_memory_off.log \
+  --logs-dir work_dirs/dsqe-prescf-32-baseline56-b2 \
+  --model DSQE-PreSCF \
+  --output-dir work_dirs/dsqe-prescf-32-baseline56-b2/eval_results
+```
+
+上面的完整训练与 validation 可能需要数小时，不能由源码单元测试替代。
+最终报告必须明确列出 checkpoint、有效 token 数、`IoU/mIoU`（1s/2s/3s）、
+dynamic/static 分项、规划 L2 和碰撞率，并注明是否使用预测角色和预测 ego pose
+闭环。当前工作树尚未产生这些正式 PreSCF 指标。

@@ -16,6 +16,11 @@ class DSQEJointRefine(nn.Module):
         self.role_correction = nn.Linear(embed_dims, num_points)
         self.semantic_head = nn.Linear(embed_dims, num_classes)
 
+    def predict_semantics(self, query_feat, points_metric):
+        """Predict absolute logits from the corrected feature/point state."""
+        point_features = query_feat.unsqueeze(2) + self.point_proj(points_metric)
+        return self.semantic_head(point_features)
+
     def forward(self, base_feat, dynamic_feat, static_feat, points_metric):
         if base_feat.shape[1] == 0:
             empty = points_metric.new_zeros(points_metric.shape)
@@ -32,8 +37,7 @@ class DSQEJointRefine(nn.Module):
         joint = self.norm(joint + self.ffn(joint))
         point_delta = self.point_correction(joint).reshape(*joint.shape[:2], points_metric.shape[2], 3).tanh()
         role_delta = self.role_correction(joint).unsqueeze(-1)
-        point_features = joint.unsqueeze(2) + self.point_proj(points_metric)
-        semantic_logits = self.semantic_head(point_features)
+        semantic_logits = self.predict_semantics(joint, points_metric)
         return dict(query_feat=joint, point_correction=point_delta,
                     role_correction=role_delta,
                     semantic_logits=semantic_logits)

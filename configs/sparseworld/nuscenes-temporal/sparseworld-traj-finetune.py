@@ -195,7 +195,8 @@ train_pipeline = [
     dict(
         type='Collect4D', keys=['img', 'voxel_semantics',
                                 'mask_lidar','mask_camera',
-                                 'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_ego2global',
+                                 'rays', 'temporal_semantics', 'temporal_rays', 'temporal_ego_states', 'temporal_trajs','temporal2ego','temporal_adjacent2ego','temporal_ego2global',
+                                 'temporal_agent_boxes', 'temporal_agent_feats', 'temporal_agent_labels',
                                ],meta_keys = ('filename','ori_shape','img_shape','pad_shape','lidar2img','img_timestamp','ego2lidar','ego2global','sample_idx',))
 ]
 
@@ -217,7 +218,7 @@ test_pipeline = [
             dict(type='Collect4D', keys=['img', 'voxel_semantics',
                                         'mask_lidar','mask_camera','temporal_semantics',
                                         'temporal_ego_states', 'temporal_ego2global',
-                                        'temporal_trajs', 'temporal_agent_boxes', 'temporal_agent_feats',],
+                                        'temporal_trajs', 'temporal_agent_boxes', 'temporal_agent_feats', 'temporal_agent_labels',],
                  meta_keys = ['filename','box_type_3d','ori_shape','img_shape','pad_shape','sample_idx',
                               'lidar2img','img_timestamp','ego2lidar','ego2global',
                               'gt_boxes','gt_labels','occ_gt_path'])

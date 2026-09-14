@@ -3,9 +3,9 @@
 #
 # Defaults intentionally match the run discussed for this repository:
 #   2 GPUs, 2 samples/GPU, gradient accumulation of 4, and at most 32 epochs.
-# The model/config remains the current DSQE implementation; the script only
-# applies the project-style runtime, optimizer, checkpoint, and BaseLine
-# initialization settings at the command line.
+# The default model is DSQE-PreSCF; pass CONFIG=... to run the frozen BaseLine
+# comparison.  The script applies project-style runtime, optimizer,
+# checkpoint, and BaseLine initialization settings at the command line.
 #
 # Usage (from the repository root):
 #   bash tools/train_dsqe_project.sh
@@ -17,8 +17,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CONFIG="${CONFIG:-configs/sparseworld/nuscenes-temporal/sparseworld-traj-finetune.py}"
-WORK_DIR="${WORK_DIR:-work_dirs/dsqe-project-32-baseline56-b2}"
+CONFIG="${CONFIG:-configs/sparseworld/nuscenes-temporal/sparseworld-traj-prescf.py}"
+WORK_DIR="${WORK_DIR:-work_dirs/dsqe-prescf-32-baseline56-b2}"
 GPUS="${GPUS:-2}"
 MASTER_PORT="${MASTER_PORT:-29526}"
 PYTHON_BIN="${PYTHON_BIN:-/data/jxy/projects/env/bin/python3.9}"
