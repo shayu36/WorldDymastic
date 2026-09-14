@@ -64,8 +64,8 @@ class DSQEEgoWarp(nn.Module):
                                    current_ego_to_t0, lidar_to_ego,
                                    yaw_sin_cos):
         ego_to_lidar = self.inverse(lidar_to_ego)
-        current_lidar_to_t0 = self.compose(
-            self.compose(ego_to_lidar, current_ego_to_t0), lidar_to_ego)
+        current_lidar_to_t0 = self.ego_cumulative_to_lidar(
+            current_ego_to_t0, lidar_to_ego)
         current_delta = self.t0_displacement_to_current(
             displacement_t0_lidar, current_lidar_to_t0)
         delta3 = torch.cat([current_delta,
@@ -80,6 +80,19 @@ class DSQEEgoWarp(nn.Module):
         ego_translation = lidar_delta + ext_trans - rotated_arm
         relative_pose = torch.cat([ego_translation[..., :2], yaw_sin_cos], -1)
         return current_delta, relative_pose, self.pose_to_matrix(relative_pose)
+
+    def ego_cumulative_to_lidar(self, current_ego_to_t0, lidar_to_ego):
+        """Conjugate ``T(E_t -> E_0)`` into ``T(L_t -> L_0)``.
+
+        VAD planning targets are adjacent LiDAR-origin displacements written
+        in the fixed current-LiDAR frame.  PreSCF predicts adjacent ego
+        transforms.  This conjugation makes the two contracts compatible
+        without introducing a second translation head and also accounts for
+        the calibrated sensor lever arm during turns.
+        """
+        ego_to_lidar = self.inverse(lidar_to_ego)
+        return self.compose(
+            self.compose(ego_to_lidar, current_ego_to_t0), lidar_to_ego)
 
     def build_relative_targets(self, ego2global_sequence):
         current = ego2global_sequence[:, :-1]

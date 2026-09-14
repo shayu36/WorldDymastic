@@ -28,10 +28,16 @@ B_0 = A_1
 B_k = inv(A_k) @ A_(k+1)
 ```
 
-数据管线同时导出 `temporal_adjacent2ego`。训练时 actor box、future trajectory、
-occupancy voxel 和 Query 点都被转换到对应 future ego frame。Temporal actor boxes keep
-native nuScenes ``(w,l,h)`` sizes and are explicitly converted to the ego footprint
-ordering ``(l,w,h)`` before yaw-aware matching；推理阶段不读取未来 GT pose。
+数据管线同时导出 `temporal_adjacent2ego`。Temporal actor boxes/trajectories are
+stored by the VAD converter in the current LiDAR frame; the dataset exports
+`temporal_agent_lidar2ego`, and the model converts centers, vectors, yaw and
+footprints to E0 ego before applying the E0->Et warp. The
+`temporal_agent_boxes` field is VAD `gt_boxes`; its dimensions come directly
+from nuScenes `Box.wlh`. SECOND yaw 的局部 x/y 轴与该 ``(width,length)`` 顺序配对，
+footprint matching 因而保持这一成对约定，不单独交换尺寸轴。VAD yaw deltas
+are scalar raw adjacent increments and are converted to SECOND yaw with the
+appropriate sign. Occupancy voxels and Query points stay in the same future
+ego frame; inference never reads future GT pose.
 
 ## 3. PreSCF Query 状态
 
@@ -75,7 +81,13 @@ occupancy label；box footprint 支持适度膨胀，`others` 不作为动态候
 改变，`query_motion` 不再只是 diagnostics。
 
 `DSQEDualInteraction` 对 D←D、S←S、D←S、S←D 均使用基于 evolved metric points 的
-nearest `local_k` 邻域，且 `lambda_SD < lambda_DS`。
+nearest `local_k` 邻域，并加入连续 role log-gate 与距离 bias；参数化保证
+`lambda_SD < lambda_DS`。
+
+`DSQEJointRefine` 先在融合后的统一 Query bank 上执行共享的局部空间 self-attention
+（位置编码和 nearest-k 均来自 evolved points 的中心），再展开到每个 Query 的 48 个点
+输出 point-wise 坐标与角色纠错；不会把 48 点压缩成单点后重建。四路双流交互复用同一份
+nearest-k 拓扑，避免六步 rollout 重复构造四张全局距离矩阵。
 
 ## 5. 监督与训练阶段
 
@@ -84,29 +96,47 @@ nearest `local_k` 邻域，且 `lambda_SD < lambda_DS`。
 ```text
 L = L_occ + λ_role L_role + λ_ego L_ego
     + λ_static L_static + λ_dynamic L_dynamic + λ_smooth L_smooth
+    + λ_leak L_leak
 ```
 
 - `L_role`：按有效 GT 动/静比例自适应加权的 Focal BCE，记录 precision/recall/F1 和
   dynamic valid ratio；
 - `L_ego`：相邻 ego 平移/偏航监督；
-- `L_static`：future ego frame 中静态 voxel 的双向 coverage；
+- `L_static`：只对 carried-static Query 约束上一状态经 GT ego warp 后的时序一致性，
+  无历史的 new Query 不参与；
 - `L_dynamic`：动态 voxel 与预测点的双向 nearest-neighbor coverage，保留梯度；
-- `L_smooth`：相邻时间 Query motion 增量连续性，不把合法运动拉回零位移。
+- `L_smooth`：相邻时间 Query motion 增量连续性，并用 `motion_valid` 排除 new Query
+  首次激活时的人为零运动；
+- `L_leak`：对 GT-static Query 抑制动态 Query-level motion 泄漏；dynamic semantic
+  auxiliary BCE 直接读取未来绝对语义头的 dynamic logit。
 
-Stage 1（epoch 0–4）冻结 Backbone、RAP/TASS 及 BaseLine SCF/Planning heads，只训练
-PreSCF 模块并保持单步预测；这里不复用 BaseLine 的 `pretrain=True`，因此 future OCC
-和 absolute semantic head 从第一个 epoch 就有梯度。Stage 2 从 epoch 5 开始增加预测步数，
+Stage 1（epoch 0–4）冻结 Backbone、RAP/TASS 及 BaseLine SCF/Planning heads，训练
+role、pose、双流演化和 absolute semantic head，并保持单步预测。interaction/joint
+correction 在 identity blend 中执行，
+从而保留完整 DDP 参数图；这里不复用 BaseLine 的 `pretrain=True`，因此 future OCC
+和 absolute semantic head 从第一个 epoch 就有梯度。Stage 2 从 epoch 5 开始增加预测步数（2→3→…→6），
 role/pose teacher forcing 同步线性衰减到预测闭环。Stage 3 可通过
 `stage3_start_epoch` 解冻 TASS decoder 最后若干层，
-其 optimizer learning rate 为主学习率的 0.1 倍。
+其 optimizer learning rate 为主学习率的 0.1 倍。为兼容 DDP 的一次性 reducer，待解冻层
+从初始化开始就加入 DDP/optimizer；Stage 1/2 通过梯度门置零且关闭该参数组 weight decay，
+Stage 3 再打开梯度门，因此冻结期参数不会被 AdamW 暗中更新。
+interaction 与 joint feature path 分别从 Stage 2、Stage 3 起用 4 个 epoch 从 identity
+线性升到完整输出，避免随机新分支在阶段边界造成递归状态突变。
+
+Planning 与 ego pose 不再使用两套平移头。pose head 递归输出相邻 ego 变换，随后通过
+LiDAR 外参将累计 `T(E_t→E_0)` 共轭为 `T(L_t→L_0)`；相邻 LiDAR 原点之差作为 VAD
+planning 输出。这样共享同一个平移状态，同时不会把 ego-frame xy 直接与 E0-LiDAR
+坐标下的 planning GT 错配。
 absolute semantic head 在加载 BaseLine checkpoint 时从对应分类头 warm-start。
 
 ## 6. 运行入口与限制
 
 ```bash
-# BaseLine 对照
-CONFIG=configs/sparseworld/nuscenes-temporal/sparseworld-traj-baseline.py \
-  bash tools/train_dsqe_project.sh
+# Stage 0：固定 epoch-56 BaseLine，只评估、不继续训练
+/data/jxy/projects/env/bin/python3.9 tools/test.py \
+  --config configs/sparseworld/nuscenes-temporal/sparseworld-traj-baseline.py \
+  --checkpoint /data/jxy/projects/ckpts/epoch_56.pth \
+  --eval segm
 
 # DSQE-PreSCF（默认）
 bash tools/train_dsqe_project.sh

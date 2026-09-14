@@ -248,7 +248,8 @@ class OPUSHead(BaseModule):
             pred_paired_stamps.append(gt_stamps_list[i][pred_paired_idx_list[i]])
 
             fore_mask = (labels_list[i].reshape(num_query,-1,1)<2) | (labels_list[i].reshape(num_query,-1,1)>10)
-            self.num_stamps_all += (gt_stamps_list[i][pred_paired_idx_list[i]].reshape(num_query,num_pts,self.num_fu_frames+1) * fore_mask).sum(1)
+            if not getattr(self, '_prescf_freeze_tass_updates', False):
+                self.num_stamps_all += (gt_stamps_list[i][pred_paired_idx_list[i]].reshape(num_query,num_pts,self.num_fu_frames+1) * fore_mask).sum(1)
 
             # gt_pts_weights[i] = gt_pts_weights[i] * mask[gt_paired_idx_list[i]].squeeze(-1) * dist_mask[i]
 
@@ -435,12 +436,15 @@ class OPUSHead(BaseModule):
         if 'dims' in role_metadata and 'yaw' in role_metadata:
             dims = role_metadata['dims'].to(gt_points)
             yaw = role_metadata['yaw'].to(gt_points)
+            inflation = torch.as_tensor(
+                role_metadata.get('inflation', 0.5),
+                device=gt_points.device, dtype=gt_points.dtype)
             delta = gt_points[:, :2] - centers[index, :2]
             c, s = yaw[index].cos(), yaw[index].sin()
             local_x = c * delta[:, 0] + s * delta[:, 1]
             local_y = -s * delta[:, 0] + c * delta[:, 1]
-            footprint = ((local_x.abs() <= dims[index, 0] * 0.5 + 0.5) &
-                         (local_y.abs() <= dims[index, 1] * 0.5 + 0.5))
+            footprint = ((local_x.abs() <= dims[index, 0] * 0.5 + inflation) &
+                         (local_y.abs() <= dims[index, 1] * 0.5 + inflation))
             matched &= footprint
         role_target[matched] = actor_role[index[matched]]
         role_valid[matched] = True
@@ -640,6 +644,8 @@ class OPUSHead(BaseModule):
 
     def _loss_dynamic(self, cls_scores, output, cache, refine_pts_flat):
         """Soft dynamic geometry loss with bidirectional nearest-neighbor coverage."""
+        if cache is None:
+            return refine_pts_flat.sum() * 0
         pred_role = output['role_pred'].reshape(cls_scores.shape[0], -1)
         total, count = refine_pts_flat.new_zeros(()), refine_pts_flat.new_zeros(())
         for b, gt_points in enumerate(cache.get('gt_points_list', [])):
@@ -669,12 +675,86 @@ class OPUSHead(BaseModule):
                          pred_role[b][gt_to_pred]).clamp_min(1e-4)
             total = total + (gt_error * gt_weight).sum()
             count = count + gt_weight.sum()
-        return total / count.clamp_min(1.0)
+        geometry = total / count.clamp_min(1.0)
+        # Absolute future semantics also receive a direct dynamic/static
+        # classification signal.  This prevents geometry coverage alone from
+        # being satisfied by a role route that never predicts actor classes.
+        role_target = cache.get('role_target') if cache is not None else None
+        role_valid = cache.get('role_valid') if cache is not None else None
+        if role_target is None or role_valid is None:
+            return geometry
+        cfg = getattr(self, 'dsqe_cfg', {})
+        dynamic_ids = cfg.get(
+            'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10])
+        static_ids = cfg.get(
+            'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16])
+        # BCEWithLogits expects log odds, not log probability.  Comparing
+        # dynamic logsumexp against logsumexp over *all* classes caps the
+        # resulting sigmoid below 0.5 even for an overwhelmingly dynamic
+        # prediction.  Use the supervised static class partition as the
+        # denominator so this is a genuine D-vs-S logit.
+        dyn_logit = torch.logsumexp(cls_scores[..., dynamic_ids], dim=-1) - \
+            torch.logsumexp(cls_scores[..., static_ids], dim=-1)
+        cls_target = role_target.to(dyn_logit.dtype)
+        cls_valid = role_valid.to(dyn_logit.dtype)
+        cls_bce = F.binary_cross_entropy_with_logits(
+            dyn_logit, cls_target, reduction='none')
+        positive = ((cls_target > 0.5) * cls_valid).sum()
+        negative = ((cls_target <= 0.5) * cls_valid).sum()
+        dynamic_weight = (negative / positive.clamp_min(1.0)).clamp(
+            1.0, float(cfg.get('role_dynamic_weight_max', 20.0)))
+        cls_weight = torch.where(cls_target > 0.5,
+                                 dynamic_weight.to(cls_bce),
+                                 cls_bce.new_ones(()))
+        cls_loss = (cls_bce * cls_weight * cls_valid).sum() / \
+            cls_valid.sum().clamp_min(1.0)
+        return geometry + float(cfg.get(
+            'dynamic_semantic_weight', 0.25)) * cls_loss
 
     def _loss_static(self, output, cache, refine_pts_flat):
-        """Static-state coverage loss in the future ego frame."""
+        """Static-state temporal consistency plus weak occupancy coverage.
+
+        The primary term is carried-only: a static Query is compared with its
+        previous point state after the GT ego warp.  New Queries intentionally
+        have no contribution because they do not possess a historical static
+        identity.  The old occupancy Chamfer term remains as a fallback when
+        GT pose metadata is unavailable in a private cache.
+        """
+        target_metric = output.get('static_temporal_target_metric')
+        carried_metric = output.get('carried_evolved_metric')
+        if target_metric is not None and carried_metric is not None:
+            delta = (carried_metric - target_metric).abs().mean(-1)
+            role_cache = output.get('role_cache')
+            if role_cache is not None:
+                target = role_cache.get('role_target')
+                valid = role_cache.get('role_valid')
+                if target is not None and valid is not None:
+                    target = target[:, :carried_metric.shape[1]].to(delta)
+                    valid = valid[:, :carried_metric.shape[1]].to(delta)
+                    weights = (valid * (target < 0.5).to(delta)).to(delta)
+                else:
+                    role_pred = output.get('role_pred')
+                    weights = (1.0 - role_pred[:,
+                        :carried_metric.shape[1], :, 0]
+                               if role_pred is not None else
+                               torch.ones_like(delta))
+            else:
+                role_pred = output.get('role_pred')
+                weights = (1.0 - role_pred[:,
+                    :carried_metric.shape[1], :, 0]
+                           if role_pred is not None else
+                           torch.ones_like(delta))
+            return (delta * weights).sum() / weights.sum().clamp_min(1.0)
+
+        """Fallback coverage for caches without adjacent pose metadata."""
         total, count = refine_pts_flat.new_zeros(()), refine_pts_flat.new_zeros(())
-        pred_role = output['role_pred'].reshape(refine_pts_flat.shape[0], -1)
+        num_carried = int(output.get('num_carried', 0))
+        if num_carried <= 0:
+            return refine_pts_flat.sum() * 0
+        pred_role = output['role_pred'][:, :num_carried].reshape(
+            refine_pts_flat.shape[0], -1)
+        refine_pts_flat = refine_pts_flat.reshape(
+            refine_pts_flat.shape[0], -1, 3)[:, :pred_role.shape[1]]
         static_ids = getattr(self, 'dsqe_cfg', {}).get(
             'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16])
         for b, gt_points in enumerate(cache.get('gt_points_list', [])):
@@ -698,6 +778,38 @@ class OPUSHead(BaseModule):
                              gt_weight).sum()
             count = count + gt_weight.sum()
         return total / count.clamp_min(1.0)
+
+    def _loss_leak(self, output, cache):
+        """Suppress Query-level dynamic motion on GT-static carried state."""
+        motion = output.get('query_motion')
+        if motion is None or cache is None:
+            reference = motion if motion is not None else output.get(
+                'role_logits')
+            if reference is None:
+                for value in output.values():
+                    if torch.is_tensor(value):
+                        reference = value
+                        break
+            if reference is None:
+                return torch.tensor(0.0)
+            return reference.sum() * 0
+        target = cache.get('role_target')
+        valid = cache.get('role_valid')
+        pool = output.get('pool_weights')
+        if target is None or valid is None or pool is None:
+            return motion.sum() * 0
+        target = target.to(motion.dtype)
+        valid = valid.to(motion.dtype)
+        pool = pool.squeeze(-1).to(motion.dtype)
+        static_weight = pool * (1.0 - target) * valid
+        static_query = static_weight.sum(-1) / (
+            pool.mul(valid).sum(-1).clamp_min(1e-6))
+        motion_valid = output.get('motion_valid')
+        if motion_valid is not None:
+            static_query = static_query * motion_valid.squeeze(-1).to(
+                static_query.dtype)
+        denom = (static_query > 0).to(motion.dtype).sum().clamp_min(1.0)
+        return (motion.norm(dim=-1) * static_query).sum() / denom
 
     def loss_future(self, voxel_semantics, all_refine_pts, all_cls_scores,
                     points_mask, dsqe_outputs=None, match_cache_list=None):

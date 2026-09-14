@@ -443,12 +443,10 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
         if self.with_attr:
-            # ``gt_agent_fut_trajs`` follows the nuScenes/OccWorld convention:
-            # each pair is the actor displacement at that future horizon
-            # relative to the current ego frame (absolute-in-horizon, not a
-            # sequence of adjacent increments).  Keep the values untouched
-            # here; PreSCF selects the requested horizon when constructing
-            # role targets.
+            # ``gt_agent_fut_trajs`` follows the VAD convention: each pair is
+            # an adjacent displacement in the current LiDAR frame.  Keep the
+            # raw cache untouched here; PreSCF converts vectors to E0 ego and
+            # cumulatively integrates the requested horizon.
             gt_fut_trajs = ego_infos['gt_agent_fut_trajs'][mask]
             gt_fut_masks = ego_infos['gt_agent_fut_masks'][mask]
             gt_fut_goal = ego_infos['gt_agent_fut_goal'][mask]
@@ -465,6 +463,17 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
         #     origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
         input_dict['temporal_agent_boxes'] = torch.tensor(gt_bboxes_3d)
         input_dict['temporal_agent_feats'] = torch.tensor(attr_labels)
+        # The temporal actor cache is generated in the current LiDAR frame,
+        # while occupancy/Query points are represented in the current ego
+        # frame.  Carry the rigid calibration explicitly so PreSCF can make
+        # the conversion once and keep one coordinate contract throughout
+        # role matching and future supervision.
+        lidar2ego = np.eye(4, dtype=np.float32)
+        lidar2ego[:3, :3] = Quaternion(
+            input_dict['curr']['lidar2ego_rotation']).rotation_matrix
+        lidar2ego[:3, 3] = np.asarray(
+            input_dict['curr']['lidar2ego_translation'], dtype=np.float32)
+        input_dict['temporal_agent_lidar2ego'] = torch.from_numpy(lidar2ego)
         # Occupancy labels use a different ordering from NuScenes detection
         # labels.  Keep the mapping explicit so role supervision can reject
         # ``others`` instead of treating every non-static class as dynamic.

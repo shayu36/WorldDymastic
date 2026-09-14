@@ -247,7 +247,103 @@ def test_ragged_actor_fields_are_not_stacked_by_pipeline():
         assert result[key].stack is False
 
 
-def test_actor_absolute_displacement_and_adjacent_ego_motion_share_future_frame():
+def test_collated_ragged_actor_fields_round_trip_per_sample():
+    torch = pytest.importorskip('torch')
+    from mmcv.parallel import DataContainer, collate
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    collated = collate([
+        {'actors': DataContainer(torch.zeros(3, 9), stack=False)},
+        {'actors': DataContainer(torch.zeros(5, 9), stack=False)},
+    ], samples_per_gpu=2)['actors']
+    # MMCV's actual collated representation is intentionally nested.
+    result = SparseWorld4DTraj._to_batch_sequence(
+        collated, torch.device('cpu'), torch.float32)
+    assert [tuple(item.shape) for item in result] == [(3, 9), (5, 9)]
+
+    collated_labels = collate([
+        {'labels': DataContainer(torch.arange(3), stack=False)},
+        {'labels': DataContainer(torch.arange(5), stack=False)},
+    ], samples_per_gpu=2)['labels']
+    labels = SparseWorld4DTraj._to_batch_sequence(
+        collated_labels, torch.device('cpu'), torch.long)
+    assert [tuple(item.shape) for item in labels] == [(3,), (5,)]
+
+
+def test_collated_batch2_actor_metadata_keeps_sample_alignment():
+    torch = pytest.importorskip('torch')
+    from mmcv.parallel import DataContainer, collate
+    from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    samples = []
+    for count, label, shift in ((2, 4, 0.), (3, 1, 10.)):
+        boxes = torch.zeros(count, 9)
+        boxes[:, 0] = torch.arange(count) + shift
+        boxes[:, 3:6] = torch.tensor([2., 4., 2.])
+        feats = torch.zeros(count, 4)
+        feats[:, 2] = 1
+        samples.append(dict(
+            boxes=DataContainer(boxes, stack=False),
+            feats=DataContainer(feats, stack=False),
+            labels=DataContainer(torch.full((count,), label), stack=False),
+            lidar2ego=torch.eye(4)))
+    batch = collate(samples, samples_per_gpu=2)
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_box_inflation=0., role_box_dims_order='wlh',
+                      role_trajectory_mode='increment'),
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10), num_fu_frames=1,
+        ego_warp=DSQEEgoWarp([-40., -40., -1., 40., 40., 5.4]),
+        _to_batch_sequence=SparseWorld4DTraj._to_batch_sequence,
+        _build_adjacent_ego_targets=lambda kwargs, size, steps, device, dtype:
+            SparseWorld4DTraj._build_adjacent_ego_targets(
+                kwargs, size, steps, device, dtype))
+    metadata = SparseWorld4DTraj._build_role_metadata(
+        fake, dict(
+            temporal_agent_boxes=batch['boxes'],
+            temporal_agent_feats=batch['feats'],
+            temporal_agent_labels=batch['labels'],
+            temporal_agent_lidar2ego=batch['lidar2ego'],
+            temporal_adjacent2ego={0: torch.eye(4).repeat(2, 1, 1)}),
+        interval=1)
+    assert [item['centers'].shape[0] for item in metadata] == [2, 3]
+    assert metadata[0]['role'].eq(1).all()  # occupancy car id 4
+    assert metadata[1]['role'].eq(0).all()  # occupancy barrier id 1
+    assert torch.allclose(metadata[0]['dims'][0], torch.tensor([2., 4., 2.]))
+
+
+def test_lidar_actor_calibration_is_applied_before_role_matching():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_box_inflation=0.0,
+                      role_trajectory_mode='increment'),
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        num_fu_frames=1,
+        ego_warp=DSQEEgoWarp([-40., -40., -1., 40., 40., 5.4]),
+        _to_batch_sequence=SparseWorld4DTraj._to_batch_sequence,
+        _build_adjacent_ego_targets=lambda kwargs, batch, steps, device, dtype:
+            SparseWorld4DTraj._build_adjacent_ego_targets(
+                kwargs, batch, steps, device, dtype))
+    boxes = torch.tensor([[1., 0., 0., 2., 4., 2., 0., 0., 0.]])
+    feats = torch.zeros(1, 4)
+    feats[0, 2] = 1.0
+    l2e = torch.eye(4)
+    l2e[0, 3] = 2.0
+    metadata = SparseWorld4DTraj._build_role_metadata(
+        fake,
+        dict(temporal_agent_boxes=boxes,
+             temporal_agent_feats=feats,
+             temporal_agent_labels=torch.tensor([4]),
+             temporal_agent_lidar2ego=l2e,
+             temporal_adjacent2ego={0: torch.eye(4)}),
+        interval=0)[0]
+    assert torch.allclose(metadata['centers'][0, 0], torch.tensor(3.))
+
+
+def test_actor_absolute_compatibility_mode_and_yaw_convention():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
     from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
@@ -264,8 +360,8 @@ def test_actor_absolute_displacement_and_adjacent_ego_motion_share_future_frame(
                 kwargs, batch, steps, device, dtype))
     boxes = torch.tensor([[0., 0., 0., 4., 2., 2., 0., 0., 0.]])
     feats = torch.zeros(1, 34)
-    # The cache stores the displacement at each horizon, not increments:
-    # t=1 -> +1m and t=2 -> +2m in E0.
+    # Compatibility mode interprets the first two xy pairs as horizon
+    # displacements.  VAD production caches use increment mode below.
     feats[0, :4] = torch.tensor([1., 0., 2., 0.])
     feats[0, 12:18] = 1  # future-valid mask
     feats[0, -6:-4] = torch.tensor([0.1, 0.2])
@@ -281,7 +377,9 @@ def test_actor_absolute_displacement_and_adjacent_ego_motion_share_future_frame(
     # Actor is at +2m in E0 while E2's origin moves +2m: x(E2) == 0m.
     assert torch.allclose(metadata['centers'][0, :2],
                           torch.tensor([0., 0.]), atol=1e-6)
-    assert torch.allclose(metadata['yaw'][0], torch.tensor(0.2), atol=1e-6)
+    # gt_boxes uses SECOND yaw while the cache stores raw yaw deltas; the
+    # conversion therefore subtracts the raw +0.2 delta.
+    assert torch.allclose(metadata['yaw'][0], torch.tensor(-0.2), atol=1e-6)
     assert metadata['valid'][0] and metadata['role'][0] == 1
 
 
@@ -314,15 +412,56 @@ def test_actor_increment_cache_can_be_selected_explicitly():
              temporal_agent_labels=torch.tensor([4]),
              temporal_adjacent2ego={0: first, 1: second}),
         interval=2)[0]
-    # Explicit increment mode reproduces the legacy +1 + +2 = +3m path.
+    # Explicit increment mode integrates +1 + +2 = +3m in E0.
     assert torch.allclose(metadata['centers'][0, :2],
                           torch.tensor([1., 0.]), atol=1e-6)
-    assert torch.allclose(metadata['yaw'][0], torch.tensor(0.3), atol=1e-6)
+    assert torch.allclose(metadata['yaw'][0], torch.tensor(-0.3), atol=1e-6)
 
 
-def test_actor_box_dimensions_are_explicitly_converted_from_nuscenes_wlh():
+def test_actor_yaw_applies_lidar_and_future_ego_rotation_in_second_space():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_box_inflation=0.0,
+                      role_box_dims_order='wlh',
+                      role_yaw_encoding='raw',
+                      role_trajectory_mode='increment'),
+        dynamic_class_ids=(2, 3, 4, 5, 6, 7, 9, 10),
+        num_fu_frames=1,
+        ego_warp=DSQEEgoWarp([-40., -40., -1., 40., 40., 5.4]),
+        _to_batch_sequence=SparseWorld4DTraj._to_batch_sequence,
+        _build_adjacent_ego_targets=lambda kwargs, batch, steps, device, dtype:
+            SparseWorld4DTraj._build_adjacent_ego_targets(
+                kwargs, batch, steps, device, dtype))
+    boxes = torch.tensor([[0., 0., 0., 4., 2., 2., 0., 0., 0.]])
+    feats = torch.zeros(1, 4)
+    feats[0, 2] = 1.0
+    quarter_turn = torch.tensor(torch.pi / 2)
+    c, s = torch.cos(quarter_turn), torch.sin(quarter_turn)
+    lidar2ego = torch.eye(4)
+    lidar2ego[:2, :2] = torch.tensor([[c, -s], [s, c]])
+    e0_to_e1 = torch.eye(4)
+    e0_to_e1[:2, :2] = torch.tensor([[c, -s], [s, c]])
+    metadata = SparseWorld4DTraj._build_role_metadata(
+        fake,
+        dict(temporal_agent_boxes=boxes,
+             temporal_agent_feats=feats,
+             temporal_agent_labels=torch.tensor([4]),
+             temporal_agent_lidar2ego=lidar2ego,
+             temporal_adjacent2ego={0: torch.linalg.inv(e0_to_e1)}),
+        interval=1)[0]
+    # SECOND yaw rotates with the opposite sign of the raw frame rotation:
+    # -lidar_yaw - actor_delta - (E0->E1)_yaw = -pi.
+    assert torch.allclose(metadata['yaw'][0], torch.tensor(-torch.pi),
+                          atol=1e-5)
+
+
+def test_actor_box_dimensions_preserve_vad_wlh_for_second_yaw_footprint():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
     from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
 
     fake = SimpleNamespace(
@@ -334,8 +473,7 @@ def test_actor_box_dimensions_are_explicitly_converted_from_nuscenes_wlh():
         _build_adjacent_ego_targets=lambda kwargs, batch, steps, device, dtype:
             SparseWorld4DTraj._build_adjacent_ego_targets(
                 kwargs, batch, steps, device, dtype))
-    # Native nuScenes (w,l,h) = (2, 4, 2): a point at x=1.9 is inside the
-    # length axis after conversion, while x=2.1 is outside.
+    # VAD concatenates native nuScenes Box.wlh into ``gt_boxes``.
     boxes = torch.tensor([[0., 0., 0., 2., 4., 2., 0., 0., 0.]])
     feats = torch.zeros(1, 2 + 1 + 1)
     feats[0, 2] = 1.0  # one valid future step
@@ -346,7 +484,97 @@ def test_actor_box_dimensions_are_explicitly_converted_from_nuscenes_wlh():
              temporal_agent_labels=torch.tensor([4]),
              temporal_adjacent2ego={0: torch.eye(4)}),
         interval=1)[0]
-    assert torch.allclose(metadata['dims'][0], torch.tensor([4., 2., 2.]))
+    assert torch.allclose(metadata['dims'][0], torch.tensor([2., 4., 2.]))
+    # With SECOND yaw=0, local x uses width (half extent 1) and local y uses
+    # length (half extent 2).  This detects an accidental axis-only swap.
+    _, valid = OPUSHead._assign_motion_state_roles(
+        torch.tensor([[1.5, 0., 0.], [0., 1.5, 0.]]),
+        torch.tensor([4, 4]), metadata,
+        static_ids=[1, 8, 11, 12, 13, 14, 15, 16],
+        dynamic_ids=[2, 3, 4, 5, 6, 7, 9, 10])
+    assert torch.equal(valid, torch.tensor([False, True]))
+
+
+def test_shared_ego_pose_is_exported_in_vad_lidar_planning_frame():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+
+    warp = DSQEEgoWarp([-40., -40., -1., 40., 40., 5.4])
+    cumulative = torch.eye(4).unsqueeze(0)
+    cumulative[:, 0, 3] = 3.0  # three metres forward in E0 ego
+    # nuScenes LIDAR_TOP is approximately -90 degrees from ego axes.
+    lidar_to_ego = torch.eye(4).unsqueeze(0)
+    angle = torch.tensor(-torch.pi / 2)
+    c, s = angle.cos(), angle.sin()
+    lidar_to_ego[:, :2, :2] = torch.tensor([[c, -s], [s, c]])
+    lidar_cumulative = warp.ego_cumulative_to_lidar(
+        cumulative, lidar_to_ego)
+    # The same pose state becomes +y in the fixed current-LiDAR frame.
+    assert torch.allclose(lidar_cumulative[0, :2, 3],
+                          torch.tensor([0., 3.]), atol=1e-6)
+
+
+def test_joint_refine_spatial_attention_runs_over_shared_queries():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_joint_refine import DSQEJointRefine
+
+    module = DSQEJointRefine(8, 4, num_classes=17, num_heads=2)
+    seen = []
+    handle = module.spatial_attn[0].register_forward_pre_hook(
+        lambda _module, args: seen.append(tuple(args[0].shape)))
+    feature = torch.randn(1, 3, 8)
+    points = torch.randn(1, 3, 4, 3)
+    output = module(feature, feature, feature, points)
+    handle.remove()
+    # Three flattened Query neighborhoods, each with one receiver token.
+    assert seen == [(3, 1, 8)]
+    assert output['point_correction'].shape == (1, 3, 4, 3)
+
+
+def test_dual_interaction_loads_legacy_gate_checkpoint():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_dual_interaction import DSQEDualInteraction
+
+    source = DSQEDualInteraction(8, num_heads=2, dropout=0.)
+    legacy = source.state_dict()
+    legacy.pop('lambda_ds_raw')
+    legacy.pop('lambda_sd_ratio_raw')
+    legacy['dynamic_from_static'] = torch.tensor(2.)
+    legacy['static_from_dynamic'] = torch.tensor(0.5)
+    target = DSQEDualInteraction(8, num_heads=2, dropout=0.)
+    target.load_state_dict(legacy, strict=True)
+    assert torch.allclose(target.dynamic_from_static_gate, torch.tensor(2.))
+    assert torch.allclose(target.static_from_dynamic_gate, torch.tensor(0.5))
+
+
+def test_staged_tass_gradient_gate_is_ddp_safe():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    fake = SimpleNamespace(_prescf_tass_frozen=True)
+    gradient = torch.ones(3)
+    assert torch.equal(SparseWorld4DTraj._prescf_tass_gradient_gate(
+        fake, gradient), torch.zeros(3))
+    fake._prescf_tass_frozen = False
+    assert torch.equal(SparseWorld4DTraj._prescf_tass_gradient_gate(
+        fake, gradient), gradient)
+
+
+def test_interaction_and_joint_stage_gates_ramp_from_identity():
+    pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    fake = SimpleNamespace(
+        training=True, curr_epoch=0, prescf_stage1_end_epoch=5,
+        prescf_stage2_end_epoch=16, prescf_interaction_ramp_epochs=4,
+        prescf_joint_ramp_epochs=4)
+    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (0., 0.)
+    fake.curr_epoch = 5
+    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (0.25, 0.)
+    fake.curr_epoch = 16
+    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (1., 0.25)
+    fake.training = False
+    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (1., 1.)
 
 
 def test_six_step_prescf_rollout_recurses_and_backpropagates():
@@ -361,9 +589,32 @@ def test_six_step_prescf_rollout_recurses_and_backpropagates():
         root / 'configs/sparseworld/nuscenes-temporal/sparseworld-traj-prescf.py'))
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'),
                         test_cfg=cfg.get('test_cfg')).cuda().eval()
-    for module in (model.img_backbone, model.img_neck, model.pts_bbox_head,
+    # A BaseLine checkpoint has no absolute PreSCF semantic head.  Loading
+    # its point-specific classifier must warm-start the new head.
+    source_weight = torch.randn_like(model.cls_branch[-1].weight.cpu()) * 0.01
+    source_bias = torch.randn_like(model.cls_branch[-1].bias.cpu()) * 0.01
+    model.load_state_dict({
+        'cls_branch.4.weight': source_weight,
+        'cls_branch.4.bias': source_bias,
+    }, strict=False)
+    expected_weight = source_weight.reshape(
+        -1, 17, source_weight.shape[-1]).mean(0).cuda()
+    expected_bias = source_bias.reshape(-1, 17).mean(0).cuda()
+    assert torch.allclose(model.joint_refine.semantic_head.weight,
+                          expected_weight)
+    assert torch.allclose(model.joint_refine.semantic_head.bias,
+                          expected_bias)
+    for module in (model.img_backbone, model.img_neck,
                    model.plan_head, model.ego_cross_attn, model.traj_head):
         assert not any(parameter.requires_grad for parameter in module.parameters())
+    decoder_layers = list(model.pts_bbox_head.transformer.decoder.decoder_layers)
+    staged_ids = {
+        id(parameter) for layer in decoder_layers[-2:]
+        for parameter in layer.parameters()
+    }
+    assert staged_ids
+    for parameter in model.pts_bbox_head.parameters():
+        assert parameter.requires_grad == (id(parameter) in staged_ids)
     model.set_epoch(0)
     assert not model.pretrain and not model.pts_bbox_head.pretrain
     assert model.prescf_role_teacher_forcing == 1
