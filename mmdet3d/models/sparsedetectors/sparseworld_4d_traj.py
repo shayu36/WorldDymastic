@@ -936,6 +936,134 @@ class SparseWorld4DTraj(OPUS):
             valid[b].reshape(-1, 1)[matched] = True
         return target, valid
 
+    @staticmethod
+    def _query_actor_ids(point_actor_id, actor_valid=None):
+        """Reduce point associations to a stable per-Query actor ID.
+
+        IDs are batch-local row indices in ``temporal_agent_*``.  Majority
+        voting only considers valid dynamic point associations; static map
+        classes and unmatched points retain ``-1``.
+        """
+        batch, queries = point_actor_id.shape[:2]
+        query_actor_id = point_actor_id.new_full((batch, queries), -1)
+        if actor_valid is None:
+            actor_valid = point_actor_id >= 0
+        for b in range(batch):
+            for q in range(queries):
+                ids = point_actor_id[b, q][actor_valid[b, q] &
+                                                (point_actor_id[b, q] >= 0)]
+                if ids.numel():
+                    values, counts = torch.unique(ids, return_counts=True)
+                    query_actor_id[b, q] = values[counts.argmax()]
+        return query_actor_id
+
+    @classmethod
+    def _initialize_actor_association(cls, points_metric, metadata):
+        """Associate newly activated Query points with GT dynamic actors.
+
+        The association is created once from the actor's inflated footprint
+        and then carried recursively.  It never depends on predicted role
+        probability and is not recomputed when a carried Query drifts.
+        """
+        batch, queries, num_points = points_metric.shape[:3]
+        point_actor_id = torch.full(
+            (batch, queries, num_points), -1, device=points_metric.device,
+            dtype=torch.long)
+        actor_valid = torch.zeros_like(point_actor_id, dtype=torch.bool)
+        if metadata is not None:
+            for b in range(min(batch, len(metadata))):
+                actors = metadata[b]
+                if not actors or actors.get('centers') is None:
+                    continue
+                centers = actors['centers'].to(points_metric)
+                if not centers.numel():
+                    continue
+                role = actors['role'].to(points_metric) > 0.5
+                valid = actors.get(
+                    'valid', torch.ones_like(role, dtype=torch.bool))
+                valid = valid.to(points_metric.device).bool() & role
+                radius = actors['radius'].to(points_metric)
+                points = points_metric[b].reshape(-1, 3)
+                distance = torch.cdist(points[:, :2], centers[:, :2])
+                nearest, index = distance.min(dim=1)
+                matched = (nearest <= radius[index]) & valid[index]
+                dims, yaw = actors.get('dims'), actors.get('yaw')
+                if dims is not None and yaw is not None:
+                    dims = dims.to(points_metric).abs()
+                    yaw = yaw.to(points_metric)
+                    inflation = torch.as_tensor(
+                        actors.get('inflation', 0.5),
+                        device=points_metric.device, dtype=points_metric.dtype)
+                    delta = points[:, :2] - centers[index, :2]
+                    c, s = yaw[index].cos(), yaw[index].sin()
+                    local_x = c * delta[:, 0] + s * delta[:, 1]
+                    local_y = -s * delta[:, 0] + c * delta[:, 1]
+                    matched &= (
+                        local_x.abs() <= dims[index, 0] * 0.5 + inflation)
+                    matched &= (
+                        local_y.abs() <= dims[index, 1] * 0.5 + inflation)
+                flat_ids = point_actor_id[b].reshape(-1)
+                flat_valid = actor_valid[b].reshape(-1)
+                flat_ids[matched] = index[matched]
+                flat_valid[matched] = True
+        return dict(
+            point_actor_id=point_actor_id,
+            query_actor_id=cls._query_actor_ids(point_actor_id),
+            actor_valid=actor_valid)
+
+    @staticmethod
+    def _refresh_actor_association(point_actor_id, metadata):
+        """Apply actor future validity without changing persistent IDs."""
+        actor_valid = torch.zeros_like(point_actor_id, dtype=torch.bool)
+        if metadata is None:
+            return actor_valid
+        for b in range(min(point_actor_id.shape[0], len(metadata))):
+            actors = metadata[b]
+            if not actors or actors.get('role') is None:
+                continue
+            role = actors['role'].to(point_actor_id.device) > 0.5
+            valid = actors.get(
+                'valid', torch.ones_like(role, dtype=torch.bool))
+            valid = valid.to(point_actor_id.device).bool() & role
+            ids = point_actor_id[b]
+            in_range = (ids >= 0) & (ids < valid.numel())
+            actor_valid[b][in_range] = valid[ids[in_range]]
+        return actor_valid
+
+    @classmethod
+    def _apply_actor_association_to_role_cache(
+            cls, cache, point_actor_id, metadata):
+        """Override associated point roles using persistent GT actor IDs."""
+        if cache is None:
+            return None
+        cache = dict(cache)
+        target = cache['role_target'].clone()
+        valid = cache['role_valid'].clone()
+        if target.shape != point_actor_id.shape:
+            raise ValueError(
+                'role cache shape {} does not match actor association {}'.format(
+                    tuple(target.shape), tuple(point_actor_id.shape)))
+        actor_valid = cls._refresh_actor_association(
+            point_actor_id, metadata)
+        associated = point_actor_id >= 0
+        # Associations are created only for dynamic actors.  An invalid future
+        # actor is ignored instead of being silently rematched as static.
+        target[associated] = 1.0
+        valid[associated] = actor_valid[associated]
+        cache.update(
+            role_target=target,
+            role_valid=valid,
+            point_actor_id=point_actor_id.clone(),
+            query_actor_id=cls._query_actor_ids(point_actor_id),
+            actor_valid=actor_valid)
+        return cache
+
+    @staticmethod
+    def _prescf_supervision_caches(state):
+        """Return the time-aligned role and future-geometry caches."""
+        return (state.get('current_role_cache'),
+                state.get('future_match_cache'))
+
     def loss_traj(self, pred_traj, gt_traj, ego_interval):
         loss_dict = dict()
         loss_dict[f'loss_traj_{str(ego_interval)}s'] = self.l2_loss(pred_traj, gt_traj)
@@ -1147,6 +1275,7 @@ class SparseWorld4DTraj(OPUS):
         state_points = all_points[:, current_mask]
         state_semantics = all_semantics[:, current_mask]
         state_role = None
+        state_point_actor_id = None
         activation = state_points.new_zeros(
             batch_size, state_points.shape[1], dtype=torch.long)
         cumulative = self.ego_warp.identity(
@@ -1207,6 +1336,28 @@ class SparseWorld4DTraj(OPUS):
             state_feat = torch.cat([state_feat, new_feat], dim=1)
             state_points = torch.cat([state_points, new_points_current], dim=1)
             state_semantics = torch.cat([state_semantics, new_semantics], dim=1)
+            current_metadata = (role_metadata_at(interval)
+                                if self.training else None)
+            # Establish actor identity exactly once when a Query enters the
+            # recurrent state.  Carried IDs are never recomputed from drifted
+            # predictions; only the newly activated slice is independently
+            # matched at its own current horizon.
+            if state_point_actor_id is None:
+                association = self._initialize_actor_association(
+                    decode_points(state_points, self.pc_range),
+                    current_metadata)
+                state_point_actor_id = association['point_actor_id']
+            elif num_new:
+                new_association = self._initialize_actor_association(
+                    decode_points(new_points_current, self.pc_range),
+                    current_metadata)
+                state_point_actor_id = torch.cat([
+                    state_point_actor_id,
+                    new_association['point_actor_id']], dim=1)
+            current_actor_valid = self._refresh_actor_association(
+                state_point_actor_id, current_metadata)
+            current_query_actor_id = self._query_actor_ids(
+                state_point_actor_id)
             source = state_points.new_zeros(batch_size, num_carried + num_new, 1)
             source[:, :num_carried] = 1
             activation = torch.cat([
@@ -1235,7 +1386,7 @@ class SparseWorld4DTraj(OPUS):
                 # Routing is conditioned on the current state E_t.  Match
                 # carried points against actors at t (not t+1); applying the
                 # next ego transform here would supervise the wrong frame.
-                metadata = role_metadata_at(interval)
+                metadata = current_metadata
                 current_semantics = kwargs.get('voxel_semantics_current')
                 if interval > 0:
                     temporal = kwargs.get('temporal_semantics')
@@ -1252,6 +1403,8 @@ class SparseWorld4DTraj(OPUS):
                     role_cache = self.pts_bbox_head.build_role_match_cache(
                         state_points, current_semantics,
                         role_metadata=metadata)
+                    role_cache = self._apply_actor_association_to_role_cache(
+                        role_cache, state_point_actor_id, metadata)
                     role_target = role_cache['role_target'].unsqueeze(-1)
                     role_target_valid = role_cache['role_valid'].unsqueeze(-1)
                 elif metadata is not None:
@@ -1259,14 +1412,16 @@ class SparseWorld4DTraj(OPUS):
                         decode_points(state_points, self.pc_range), metadata)
                     role_cache = dict(role_target=role_target.squeeze(-1),
                                       role_valid=role_target_valid.squeeze(-1))
+                    role_cache = self._apply_actor_association_to_role_cache(
+                        role_cache, state_point_actor_id, metadata)
+                    role_target = role_cache['role_target'].unsqueeze(-1)
+                    role_target_valid = role_cache['role_valid'].unsqueeze(-1)
                 if role_cache is not None and self.prescf_role_teacher_forcing > 0:
                     teacher_role = role_target
                     teacher_valid = role_target_valid.clone()
-                    # New Queries have no reliable temporal identity.  They
-                    # may be supervised by the future occupancy cache, but
-                    # must not inherit a carried Query's GT role teacher.
-                    if num_new and teacher_valid is not None:
-                        teacher_valid[:, num_carried:] = False
+                    # New Queries use their own activation-time association.
+                    # ``role_prior_valid`` remains false for that slice, so no
+                    # carried role can leak into this GT teacher route.
             role = self.role_router(
                 conditioned_feat, state_points, state_semantics, source,
                 role_prior=role_prior, role_prior_valid=role_prior_valid,
@@ -1387,7 +1542,15 @@ class SparseWorld4DTraj(OPUS):
                     metadata = role_metadata_at(interval + 1)
                     match_cache = self.pts_bbox_head.build_future_match_cache(
                         final_points, future, role_metadata=metadata)
+                    match_cache = self._apply_actor_association_to_role_cache(
+                        match_cache, state_point_actor_id, metadata)
             match_cache_list.append(match_cache)
+            future_metadata = (role_metadata_at(interval + 1)
+                               if self.training else None)
+            future_actor_valid = self._refresh_actor_association(
+                state_point_actor_id, future_metadata)
+            future_query_actor_id = self._query_actor_ids(
+                state_point_actor_id)
             role_loss = final_metric.new_zeros(())
             dynamic_loss = final_metric.new_zeros(())
             static_loss = final_metric.new_zeros(())
@@ -1435,6 +1598,9 @@ class SparseWorld4DTraj(OPUS):
                 gt_pose_target=(gt_pose.detach() if gt_pose is not None else None),
                 input_feat=state_feat, input_points=state_points,
                 input_semantics=state_semantics,
+                input_point_actor_id=state_point_actor_id,
+                input_query_actor_id=current_query_actor_id,
+                current_actor_valid=current_actor_valid,
                 points_metric=final_metric, evolved_points_metric=evolved['points_metric'],
                 carried_prior_metric=evolved['carried_prior_metric'],
                 carried_evolved_metric=final_metric[:, :num_carried],
@@ -1442,8 +1608,12 @@ class SparseWorld4DTraj(OPUS):
                 semantics=semantics, joint_feat=joint['query_feat'],
                 loss_role=role_loss, loss_dynamic=dynamic_loss,
                 loss_static=static_loss, loss_smooth=smooth_loss,
-                num_carried=num_carried, match_cache=match_cache,
-                role_cache=role_cache,
+                num_carried=num_carried,
+                current_role_cache=role_cache,
+                future_match_cache=match_cache,
+                point_actor_id=state_point_actor_id,
+                query_actor_id=future_query_actor_id,
+                actor_valid=future_actor_valid,
                 pool_weights=role['pool_weights']))
             state_feat, state_points, state_semantics = (
                 joint['query_feat'], final_points, semantics)
@@ -1615,22 +1785,23 @@ class SparseWorld4DTraj(OPUS):
                                                'match_cache_list')))
         if self.dsqe_mode == 'prescf' and outputs.get('prescf_outputs'):
             for interval, state in enumerate(outputs['prescf_outputs'], 1):
-                cache = state.get('match_cache')
-                # Role logits drive the transition E_t -> E_(t+1), so their
-                # train target is the resulting future state.  This also
-                # provides direct supervision for newly activated Queries;
-                # current-state GT teacher forcing remains carried-only.
-                role_cache = cache if cache is not None else state.get('role_cache')
-                role_loss = (self.pts_bbox_head._loss_role(state, role_cache)
-                             if role_cache is not None and hasattr(
+                current_role_cache, future_match_cache = \
+                    self._prescf_supervision_caches(state)
+                # rho_t describes E_t/P_t/Z_t and is therefore supervised
+                # only by the current-state cache.  The cache generated from
+                # P_(t+1) is reserved for future geometry/semantics and can
+                # never feed back into the target for rho_t.
+                role_loss = (self.pts_bbox_head._loss_role(
+                                 state, current_role_cache)
+                             if current_role_cache is not None and hasattr(
                                  self.pts_bbox_head, '_loss_role') else
                              state['loss_role'])
                 losses['fu{}.loss_role'.format(interval)] = (
                     self.prescf_loss_weights['role'] * role_loss)
-                if role_cache is not None and hasattr(self.pts_bbox_head,
-                                                 '_role_metrics'):
+                if current_role_cache is not None and hasattr(
+                        self.pts_bbox_head, '_role_metrics'):
                     for metric_name, metric_value in self.pts_bbox_head._role_metrics(
-                            state, role_cache).items():
+                            state, current_role_cache).items():
                         losses['fu{}.{}'.format(interval, metric_name)] = metric_value
                 if state.get('gt_pose_target') is not None:
                     target_pose = self.ego_warp.matrix_to_pose(
@@ -1648,25 +1819,42 @@ class SparseWorld4DTraj(OPUS):
                         forecast_points_list[interval - 1].shape[0], -1, 3),
                     self.pc_range)
                 static_loss = (self.pts_bbox_head._loss_static(
-                    state, cache, refine_metric)
-                               if cache is not None and hasattr(
+                    state, current_role_cache, refine_metric)
+                               if current_role_cache is not None and hasattr(
                                    self.pts_bbox_head, '_loss_static') else
                                state['loss_static'])
                 losses['fu{}.loss_static'.format(interval)] = (
                     self.prescf_loss_weights['static'] * static_loss)
+                if future_match_cache is not None and hasattr(
+                        self.pts_bbox_head, '_loss_dynamic'):
+                    dynamic = self.pts_bbox_head._loss_dynamic(
+                        forecast_semantics_list[interval - 1], state,
+                        future_match_cache, refine_metric,
+                        return_diagnostics=True)
+                    dynamic_loss = dynamic['loss']
+                    # Diagnostic keys intentionally omit the ``loss`` token:
+                    # MMDetection sums every dict entry containing "loss".
+                    # Adding detached loss-named values would silently change
+                    # the optimization objective through double counting.
+                    for name in (
+                            'dynamic_pred_to_gt', 'dynamic_gt_to_pred',
+                            'dynamic_semantic'):
+                        value = dynamic['loss_' + name]
+                        losses['fu{}.{}'.format(interval, name)] = value.detach()
+                    for name in (
+                            'dynamic_pred_valid_ratio',
+                            'dynamic_gt_covered_ratio'):
+                        losses['fu{}.{}'.format(interval, name)] = \
+                            dynamic[name].detach()
+                else:
+                    dynamic_loss = state['loss_dynamic']
                 losses['fu{}.loss_dynamic'.format(interval)] = (
-                    self.prescf_loss_weights['dynamic'] * (
-                        self.pts_bbox_head._loss_dynamic(
-                            forecast_semantics_list[interval - 1], state,
-                            cache, refine_metric)
-                        if cache is not None and hasattr(
-                            self.pts_bbox_head, '_loss_dynamic') else
-                        state['loss_dynamic']))
+                    self.prescf_loss_weights['dynamic'] * dynamic_loss)
                 losses['fu{}.loss_smooth'.format(interval)] = (
                     self.prescf_loss_weights['smooth'] * state['loss_smooth'])
-                leak_cache = state.get('role_cache') or cache
                 leak_loss = (self.pts_bbox_head._loss_leak(
-                    state, leak_cache) if leak_cache is not None and hasattr(
+                    state, current_role_cache)
+                    if current_role_cache is not None and hasattr(
                         self.pts_bbox_head, '_loss_leak') else
                     state['loss_dynamic'] * 0)
                 losses['fu{}.loss_leak'.format(interval)] = (

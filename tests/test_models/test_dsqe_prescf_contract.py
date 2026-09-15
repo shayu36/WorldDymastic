@@ -156,9 +156,9 @@ def test_prescf_loss_keeps_dynamic_geometry_gradients():
     root = Path(__file__).parents[2]
     source = (root / 'mmdet3d/models/sparsedetectors/sparseworld_4d_traj.py').read_text()
     dynamic_call = source[source.index('self.pts_bbox_head._loss_dynamic'):]
-    assert '.detach()' not in dynamic_call.split('else', 1)[0]
+    assert 'cache, refine_metric.detach()' not in dynamic_call
     head = (root / 'mmdet3d/models/sparsedetectors/opus_head.py').read_text()
-    assert 'gt_to_pred = self._chunked_nearest_indices' in head
+    assert 'gt_distances, gt_to_pred = OPUSHead._chunked_nearest' in head
 
 
 @pytest.mark.parametrize('num_carried,num_new', [(2, 0), (0, 2), (1, 2)])
@@ -305,6 +305,59 @@ def test_bidirectional_dynamic_loss_backpropagates_to_predicted_points():
     assert predicted.grad is not None and predicted.grad.abs().sum() > 0
 
 
+def _dynamic_loss_fixture(torch):
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(
+            role_match_max_distance=2.5, dynamic_huber_beta=0.2,
+            dynamic_semantic_weight=0.,
+            dynamic_class_ids=[2, 3, 4, 5, 6, 7, 9, 10],
+            static_class_ids=[1, 8, 11, 12, 13, 14, 15, 16]),
+        _chunked_nearest_indices=OPUSHead._chunked_nearest_indices)
+    points = torch.tensor(
+        [[[-5., 0., 0.], [1., 0., 0.], [8., 0., 0.]]],
+        requires_grad=True)
+    cache = dict(
+        gt_points_list=[torch.tensor([[2., 0., 0.]])],
+        gt_role_target_list=[torch.ones(1)],
+        gt_role_valid_list=[torch.ones(1, dtype=torch.bool)],
+        role_target=torch.tensor([[[0., 1., 0.]]]),
+        role_valid=torch.ones(1, 1, 3, dtype=torch.bool))
+    scores = torch.zeros(1, 1, 3, 17)
+    output = dict(role_pred=torch.zeros(1, 1, 3, 1))
+    return fake, points, scores, output, cache
+
+
+def test_dynamic_pred_to_gt_excludes_static_predictions():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    fake, points, scores, output, cache = _dynamic_loss_fixture(torch)
+    dynamic = OPUSHead._loss_dynamic(
+        fake, scores, output, cache, points, return_diagnostics=True)
+    dynamic['loss_dynamic_pred_to_gt'].backward()
+    # Only the GT-confirmed dynamic middle point participates in this
+    # direction. Static predictions remain exactly gradient-free.
+    assert points.grad[0, 1].abs().sum() > 0
+    assert points.grad[0, 0].abs().sum() == 0
+    assert points.grad[0, 2].abs().sum() == 0
+    assert dynamic['dynamic_pred_valid_ratio'] == pytest.approx(1 / 3)
+
+
+def test_dynamic_gt_to_pred_survives_role_collapse():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    fake, points, scores, output, cache = _dynamic_loss_fixture(torch)
+    output['role_pred'].zero_()  # predicted rho collapses to static
+    dynamic = OPUSHead._loss_dynamic(
+        fake, scores, output, cache, points, return_diagnostics=True)
+    dynamic['loss_dynamic_gt_to_pred'].backward()
+    assert dynamic['loss_dynamic_gt_to_pred'] > 0
+    assert points.grad is not None and points.grad.abs().sum() > 0
+    assert torch.isfinite(points.grad).all()
+
+
 def test_role_loss_is_class_balanced_focal_and_reports_f1():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
@@ -330,6 +383,91 @@ def test_role_loss_is_class_balanced_focal_and_reports_f1():
         'query_recall', 'query_f1', 'dynamic_valid_ratio', 'ignored_ratio',
         'unmatched_ratio'} <= set(metrics)
     assert metrics['dynamic_valid_ratio'] == 0.25
+
+
+def test_role_loss_uses_current_state_cache():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    current = dict(
+        role_target=torch.tensor([[[1., 0.]]]),
+        role_valid=torch.tensor([[[True, True]]]))
+    future = dict(
+        role_target=torch.tensor([[[0., 1.]]]),
+        role_valid=torch.tensor([[[False, True]]]))
+    state = dict(current_role_cache=current, future_match_cache=future)
+    selected_current, selected_future = \
+        SparseWorld4DTraj._prescf_supervision_caches(state)
+    assert selected_current is current and selected_future is future
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_dynamic_weight=1., role_focal_gamma=2.),
+        _masked_mean=OPUSHead._masked_mean)
+    output = dict(role_logits=torch.zeros(1, 1, 2, 1))
+    expected = OPUSHead._loss_role(fake, output, current)
+    actual = OPUSHead._loss_role(fake, output, selected_current)
+    assert torch.equal(actual, expected)
+
+
+def test_future_point_perturbation_does_not_change_current_role_target():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    current_target = torch.tensor([[[1., 0., 1.]]])
+    current_valid = torch.tensor([[[True, True, False]]])
+    current = dict(role_target=current_target, role_valid=current_valid)
+    state_a = dict(
+        current_role_cache=current,
+        future_match_cache=dict(
+            role_target=torch.zeros_like(current_target),
+            role_valid=torch.zeros_like(current_valid)))
+    state_b = dict(
+        current_role_cache=current,
+        future_match_cache=dict(
+            role_target=torch.ones_like(current_target),
+            role_valid=torch.ones_like(current_valid)))
+    cache_a, _ = SparseWorld4DTraj._prescf_supervision_caches(state_a)
+    cache_b, _ = SparseWorld4DTraj._prescf_supervision_caches(state_b)
+    assert torch.equal(cache_a['role_target'], cache_b['role_target'])
+    assert torch.equal(cache_a['role_valid'], cache_b['role_valid'])
+
+
+def test_unmatched_ratio_uses_unique_thresholded_gt_coverage():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    output = dict(role_logits=torch.zeros(1, 1, 4, 1))
+    cache = dict(
+        role_target=torch.tensor([[[1., 1., 0., 0.]]]),
+        role_valid=torch.ones(1, 1, 4, dtype=torch.bool),
+        gt_role_target_list=[torch.tensor([1., 1., 0.])],
+        gt_role_valid_list=[torch.tensor([True, True, True])],
+        # Many prediction->GT assignments to GT 0 are deliberately present;
+        # they must not count as coverage for GT 1 or GT 2.
+        pred_paired_idx_list=[torch.tensor([0, 0, 0, 0])],
+        gt_to_pred_distance_list=[torch.tensor([0.1, 3.0, 4.0])],
+        role_match_max_distance=2.5)
+    metrics = OPUSHead._role_metrics(output, cache)
+    assert metrics['unique_gt_coverage_ratio'] == pytest.approx(1 / 3)
+    assert metrics['unmatched_ratio'] == pytest.approx(2 / 3)
+    assert metrics['dynamic_gt_covered_ratio'] == pytest.approx(1 / 2)
+    assert metrics['dynamic_unmatched_ratio'] == pytest.approx(1 / 2)
+    assert metrics['static_unmatched_ratio'] == pytest.approx(1.0)
+
+    empty = dict(
+        role_target=torch.zeros(1, 1, 1),
+        role_valid=torch.zeros(1, 1, 1, dtype=torch.bool),
+        gt_role_target_list=[torch.zeros(0)],
+        gt_role_valid_list=[torch.zeros(0, dtype=torch.bool)],
+        gt_to_pred_distance_list=[torch.zeros(0)],
+        role_match_max_distance=2.5)
+    empty_metrics = OPUSHead._role_metrics(
+        dict(role_logits=torch.zeros(1, 1, 1, 1)), empty)
+    for name in ('unmatched_ratio', 'dynamic_unmatched_ratio',
+                 'static_unmatched_ratio', 'dynamic_gt_covered_ratio',
+                 'unique_gt_coverage_ratio'):
+        assert torch.isfinite(empty_metrics[name])
+        assert empty_metrics[name] == 0
 
 
 def test_local_attention_uses_only_nearest_k_senders():
@@ -621,6 +759,74 @@ def test_actor_box_dimensions_preserve_vad_wlh_for_second_yaw_footprint():
     assert torch.equal(valid, torch.tensor([False, True]))
 
 
+def _association_metadata(torch, valid=(True, True)):
+    return [dict(
+        centers=torch.tensor([[0., 0., 0.], [10., 0., 0.]]),
+        radius=torch.tensor([3., 3.]),
+        role=torch.tensor([1., 1.]),
+        valid=torch.tensor(valid),
+        labels=torch.tensor([4, 4]),
+        dims=torch.tensor([[4., 4., 2.], [4., 4., 2.]]),
+        yaw=torch.tensor([0., 0.]),
+        inflation=0.)]
+
+
+def test_carried_actor_association_is_propagated():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    points = torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]])
+    association = SparseWorld4DTraj._initialize_actor_association(
+        points, _association_metadata(torch))
+    point_actor_id = association['point_actor_id']
+    assert point_actor_id.tolist() == [[[0, 0]]]
+    # Six arbitrarily drifted future geometries do not rewrite identity.
+    for _ in range(6):
+        drifted_points = points + torch.randn_like(points) * 100
+        del drifted_points  # geometry is intentionally irrelevant after activation
+        valid = SparseWorld4DTraj._refresh_actor_association(
+            point_actor_id, _association_metadata(torch))
+        assert point_actor_id.tolist() == [[[0, 0]]]
+        assert valid.all()
+        assert SparseWorld4DTraj._query_actor_ids(
+            point_actor_id).item() == 0
+
+
+def test_new_query_actor_association_is_initialized_independently():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    metadata = _association_metadata(torch)
+    carried = SparseWorld4DTraj._initialize_actor_association(
+        torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]]), metadata)
+    new = SparseWorld4DTraj._initialize_actor_association(
+        torch.tensor([[[[10., 0., 0.], [11., 0., 0.]]]]), metadata)
+    combined = torch.cat(
+        [carried['point_actor_id'], new['point_actor_id']], dim=1)
+    assert combined.tolist() == [[[0, 0], [1, 1]]]
+    assert SparseWorld4DTraj._query_actor_ids(combined).tolist() == [[0, 1]]
+
+
+def test_actor_invalidity_masks_future_role_supervision():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    points = torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]])
+    association = SparseWorld4DTraj._initialize_actor_association(
+        points, _association_metadata(torch))
+    point_actor_id = association['point_actor_id']
+    original = dict(
+        role_target=torch.zeros(1, 1, 2),
+        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
+    future = SparseWorld4DTraj._apply_actor_association_to_role_cache(
+        original, point_actor_id, _association_metadata(torch, (False, True)))
+    assert future['point_actor_id'].tolist() == [[[0, 0]]]
+    assert future['query_actor_id'].item() == 0  # identity persists
+    assert future['role_target'].eq(1).all()
+    assert not future['role_valid'].any()  # supervision follows future validity
+    assert not future['actor_valid'].any()
+
+
 def test_shared_ego_pose_is_exported_in_vad_lidar_planning_frame():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
@@ -810,6 +1016,147 @@ def test_stage1_gate_and_curriculum_contract_are_nonzero_and_explicit():
     for epoch, expected in ((0, 1), (5, 2), (9, 3), (13, 6)):
         fake.curr_epoch = epoch
         assert SparseWorld4DTraj._num_forecast_frames(fake) == expected
+
+
+def _build_cuda_prescf_detector(torch):
+    from mmcv import Config
+    from mmdet3d.models import build_model
+
+    root = Path(__file__).parents[2]
+    cfg = Config.fromfile(str(
+        root / 'configs/sparseworld/nuscenes-temporal/'
+        'sparseworld-traj-prescf.py'))
+    model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'),
+                        test_cfg=cfg.get('test_cfg')).cuda()
+    return model
+
+
+def test_all_prescf_modules_receive_effective_gradients():
+    """Use real detector losses, including ragged actor supervision.
+
+    Two optimizer iterations are intentional: zero-initialized point/semantic
+    adapters expose their terminal projection on iteration one and their
+    preceding layers after that projection has moved away from zero.
+    """
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is required for real forward_train gradient test')
+    from tools.test_prescf_ddp_smoke import (
+        _gradient_stats, _group_parameter_names, build_smoke_optimizer,
+        make_batch)
+
+    model = _build_cuda_prescf_detector(torch)
+    try:
+        model.set_epoch(0)
+        model.train()
+        groups, _ = _group_parameter_names(model)
+        optimizer, _ = build_smoke_optimizer(model)
+        batch = make_batch(2, torch.device('cuda'), 32, 64)
+        ever_nonzero = {group: False for group in groups}
+        required_losses = (
+            '.loss_cls', '.loss_pts', '.loss_role', '.loss_ego',
+            '.loss_static', '.loss_dynamic', '.loss_smooth', '.loss_leak',
+            'loss_traj_')
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            losses = model.forward_train(**batch)
+            for required in required_losses:
+                assert any(required in name for name in losses), required
+            objective = sum(
+                value for value in losses.values()
+                if torch.is_tensor(value) and value.requires_grad)
+            assert torch.isfinite(objective)
+            objective.backward()
+            for group, names in groups.items():
+                stats = _gradient_stats(model, names)
+                assert not stats['grad_is_none'], group
+                assert stats['grad_is_finite'], group
+                ever_nonzero[group] |= (
+                    stats['grad_abs_sum'] > 0 and
+                    stats['nonzero_ratio'] > 0)
+            optimizer.step()
+        assert all(ever_nonzero.values()), ever_nonzero
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+def test_stage12_tass_parameters_do_not_change():
+    """The DDP-visible staged TASS layers remain exact frozen anchors."""
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is required to construct the detector')
+    from tools.test_prescf_ddp_smoke import (
+        _staged_tass_parameter_names, build_smoke_optimizer)
+
+    model = _build_cuda_prescf_detector(torch)
+    try:
+        optimizer, optimizer_staged = build_smoke_optimizer(model)
+        staged = _staged_tass_parameter_names(model)
+        assert staged and staged == optimizer_staged
+        named = dict(model.named_parameters())
+        reference = {
+            name: named[name].detach().clone() for name in staged}
+        for epoch in (0, model.prescf_stage1_end_epoch):
+            model.set_epoch(epoch)
+            assert model._prescf_tass_frozen
+            optimizer.zero_grad(set_to_none=True)
+            # Exercise the registered gradient gate directly through
+            # autograd.  Zero decay on this optimizer group must then make
+            # the complete AdamW step an exact no-op.
+            sum(named[name].sum() for name in staged).backward()
+            assert all(named[name].grad is not None for name in staged)
+            assert all(torch.count_nonzero(named[name].grad) == 0
+                       for name in staged)
+            optimizer.step()
+            assert all(torch.equal(named[name].detach(), reference[name])
+                       for name in staged)
+    finally:
+        del model
+        torch.cuda.empty_cache()
+
+
+def test_stage3_only_unfreezes_configured_tass_layers():
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is required to construct the detector')
+    from tools.test_prescf_ddp_smoke import (
+        _staged_tass_parameter_names, build_smoke_optimizer)
+
+    model = _build_cuda_prescf_detector(torch)
+    try:
+        staged = _staged_tass_parameter_names(model)
+        all_tass = {
+            name for name, _ in model.named_parameters()
+            if name.startswith('pts_bbox_head.')}
+        named = dict(model.named_parameters())
+        model.set_epoch(int(model.dsqe_cfg['stage3_start_epoch']))
+        assert not model._prescf_tass_frozen
+        assert {name for name in all_tass if named[name].requires_grad} == staged
+        optimizer, optimizer_staged = build_smoke_optimizer(model)
+        assert optimizer_staged == staged
+        staged_group = next(
+            group for group in optimizer.param_groups
+            if group['group_name'] == 'tass_stage3')
+        main_group = next(
+            group for group in optimizer.param_groups
+            if group['group_name'] == 'prescf')
+        assert staged_group['lr'] == pytest.approx(main_group['lr'] * 0.1)
+        assert staged_group['weight_decay'] == 0.
+        optimizer.zero_grad(set_to_none=True)
+        sum(named[name].sum() for name in staged).backward()
+        assert all(named[name].grad is not None and
+                   torch.count_nonzero(named[name].grad) > 0
+                   for name in staged)
+        reference = {
+            name: named[name].detach().clone() for name in staged}
+        optimizer.step()
+        assert any(not torch.equal(named[name].detach(), reference[name])
+                   for name in staged)
+        assert all(not named[name].requires_grad for name in all_tass - staged)
+    finally:
+        del model
+        torch.cuda.empty_cache()
 
 
 def test_six_step_prescf_rollout_recurses_and_backpropagates():

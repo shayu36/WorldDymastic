@@ -44,6 +44,9 @@ model = dict(
         role_dynamic_weight_max=20.0,
         role_focal_gamma=2.0,
         role_match_max_distance=2.5,
+        # Bidirectional dynamic coverage uses a robust pointwise Huber loss;
+        # this beta is in metric metres after Query points are decoded.
+        dynamic_huber_beta=0.2,
         planar_motion_only=False,
         dynamic_semantic_weight=0.25,
         lambda_role=0.1,

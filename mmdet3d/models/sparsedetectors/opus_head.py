@@ -459,10 +459,16 @@ class OPUSHead(BaseModule):
     @staticmethod
     def _chunked_nearest(query_points, reference_points, chunk_size=1024):
         """Return non-differentiable L1 nearest distances and indices."""
-        if query_points.shape[0] == 0 or reference_points.shape[0] == 0:
+        if query_points.shape[0] == 0:
             return (torch.empty(query_points.shape[0], device=query_points.device,
                                 dtype=query_points.dtype),
                     torch.empty(query_points.shape[0], device=query_points.device,
+                                dtype=torch.long))
+        if reference_points.shape[0] == 0:
+            return (torch.full((query_points.shape[0],), float('inf'),
+                               device=query_points.device,
+                               dtype=query_points.dtype),
+                    torch.zeros(query_points.shape[0], device=query_points.device,
                                 dtype=torch.long))
         nearest = []
         nearest_indices = []
@@ -521,7 +527,7 @@ class OPUSHead(BaseModule):
             pred_index_list.append(pred_index); cls_weight_list.append(cls_weight)
             gt_weight_list.append(gt_weight); role_target_list.append(target)
             role_valid_list.append(valid)
-        role_targets, role_valids = [], []
+        role_targets, role_valids, gt_to_pred_distances = [], [], []
         for b in range(batch_size):
             pred_index = pred_index_list[b]
             if pred_index.numel():
@@ -539,6 +545,11 @@ class OPUSHead(BaseModule):
                 role_targets.append(decoded.new_zeros(decoded.shape[1]))
                 role_valids.append(torch.zeros(decoded.shape[1], device=decoded.device,
                                                dtype=torch.bool))
+            gt_distances, _ = self._chunked_nearest(
+                gt_points_list[b], decoded[b])
+            gt_to_pred_distances.append(gt_distances)
+        role_match_max_distance = float(getattr(self, 'dsqe_cfg', {}).get(
+            'role_match_max_distance', 2.5))
         return dict(labels_list=labels_list, gt_paired_idx_list=gt_index_list,
                     pred_paired_idx_list=pred_index_list,
                     label_weights_list=cls_weight_list,
@@ -547,6 +558,8 @@ class OPUSHead(BaseModule):
                     gt_points_list=gt_points_list, gt_labels_list=gt_labels_list,
                     gt_role_target_list=role_target_list,
                     gt_role_valid_list=role_valid_list,
+                    gt_to_pred_distance_list=gt_to_pred_distances,
+                    role_match_max_distance=role_match_max_distance,
                     role_target=torch.stack(role_targets).reshape(
                         batch_size, num_query, num_points),
                     role_valid=torch.stack(role_valids).reshape(
@@ -568,13 +581,16 @@ class OPUSHead(BaseModule):
             'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16])
         dynamic_ids = getattr(self, 'dsqe_cfg', {}).get(
             'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10])
-        targets, valids = [], []
+        targets, valids, gt_targets, gt_valids = [], [], [], []
+        gt_to_pred_distances = []
         for b, (gt_points, gt_labels) in enumerate(zip(gt_points_list,
                                                        gt_labels_list)):
             motion = None if role_metadata is None or b >= len(role_metadata) \
                 else role_metadata[b]
             gt_target, gt_valid = self._assign_motion_state_roles(
                 gt_points, gt_labels, motion, static_ids, dynamic_ids)
+            gt_targets.append(gt_target)
+            gt_valids.append(gt_valid)
             if gt_points.numel():
                 distances, index = self._chunked_nearest(decoded[b], gt_points)
                 targets.append(gt_target[index].float())
@@ -586,10 +602,18 @@ class OPUSHead(BaseModule):
                 valids.append(torch.zeros(decoded.shape[1],
                                           device=decoded.device,
                                           dtype=torch.bool))
+            gt_distances, _ = self._chunked_nearest(gt_points, decoded[b])
+            gt_to_pred_distances.append(gt_distances)
+        role_match_max_distance = float(getattr(self, 'dsqe_cfg', {}).get(
+            'role_match_max_distance', 2.5))
         return dict(role_target=torch.stack(targets).reshape(
                         batch_size, num_query, num_points),
                     role_valid=torch.stack(valids).reshape(
-                        batch_size, num_query, num_points))
+                        batch_size, num_query, num_points),
+                    gt_role_target_list=gt_targets,
+                    gt_role_valid_list=gt_valids,
+                    gt_to_pred_distance_list=gt_to_pred_distances,
+                    role_match_max_distance=role_match_max_distance)
 
     @staticmethod
     def _masked_mean(values, mask):
@@ -645,13 +669,7 @@ class OPUSHead(BaseModule):
         logits = output['role_logits'].squeeze(-1)
         target = cache['role_target'].to(logits.dtype)
         valid = cache['role_valid'].bool()
-        if not valid.any():
-            zero = logits.new_zeros(())
-            return dict(role_precision=zero, role_recall=zero,
-                        role_f1=zero, query_precision=zero,
-                        query_recall=zero, query_f1=zero,
-                        dynamic_valid_ratio=zero, ignored_ratio=logits.new_ones(()),
-                        unmatched_ratio=logits.new_ones(()))
+        zero = logits.new_zeros(())
         pred = logits.sigmoid() >= 0.5
         positive = target >= 0.5
         tp = (pred & positive & valid).sum().to(logits.dtype)
@@ -660,7 +678,8 @@ class OPUSHead(BaseModule):
         precision = tp / (tp + fp).clamp_min(1.0)
         recall = tp / (tp + fn).clamp_min(1.0)
         f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-6)
-        ratio = (positive & valid).sum().to(logits.dtype) / valid.sum().clamp_min(1)
+        ratio = ((positive & valid).sum().to(logits.dtype) /
+                 valid.sum().clamp_min(1))
         pool = output.get('pool_weights')
         query = output.get('query_role')
         if pool is not None and query is not None:
@@ -679,28 +698,84 @@ class OPUSHead(BaseModule):
                 q_precision + q_recall).clamp_min(1e-6)
         else:
             q_precision = q_recall = q_f1 = logits.new_zeros(())
-        ignored = (~valid).to(logits.dtype).mean()
-        unmatched = logits.new_zeros(())
+        ignored = ((~valid).to(logits.dtype).mean()
+                   if valid.numel() else zero)
+
+        # Coverage is measured in the GT->prediction direction.  Each GT
+        # voxel contributes exactly once, regardless of how many predictions
+        # chose it in the opposite direction.  Thresholding distances also
+        # prevents a far-away nearest prediction from counting as coverage.
         gt_valid_list = cache.get('gt_role_valid_list', [])
-        pred_indices = cache.get('pred_paired_idx_list', [])
-        if gt_valid_list:
-            gt_total = sum(int(item.sum()) for item in gt_valid_list)
-            paired = sum(int(index.numel()) for index in pred_indices)
-            unmatched = logits.new_tensor(max(gt_total - paired, 0)) / max(gt_total, 1)
+        gt_role_list = cache.get('gt_role_target_list', [])
+        gt_distance_list = cache.get('gt_to_pred_distance_list', [])
+        max_distance = float(cache.get('role_match_max_distance', 2.5))
+        gt_total = gt_covered = dynamic_total = dynamic_covered = 0
+        static_total = static_covered = 0
+        for gt_valid, gt_role, distance in zip(
+                gt_valid_list, gt_role_list, gt_distance_list):
+            gt_valid = gt_valid.bool()
+            gt_role = gt_role.to(distance.device) > 0.5
+            covered = distance <= max_distance
+            gt_total += int(gt_valid.sum())
+            gt_covered += int((covered & gt_valid).sum())
+            dynamic = gt_valid & gt_role
+            static = gt_valid & ~gt_role
+            dynamic_total += int(dynamic.sum())
+            static_total += int(static.sum())
+            dynamic_covered += int((covered & dynamic).sum())
+            static_covered += int((covered & static).sum())
+        unmatched = logits.new_tensor(
+            (gt_total - gt_covered) / max(gt_total, 1)) if gt_total else zero
+        unique_coverage = logits.new_tensor(
+            gt_covered / max(gt_total, 1)) if gt_total else zero
+        dynamic_coverage = logits.new_tensor(
+            dynamic_covered / max(dynamic_total, 1)) if dynamic_total else zero
+        static_unmatched = logits.new_tensor(
+            (static_total - static_covered) / max(static_total, 1)
+        ) if static_total else zero
+        dynamic_unmatched = logits.new_tensor(
+            (dynamic_total - dynamic_covered) / max(dynamic_total, 1)
+        ) if dynamic_total else zero
         return dict(role_precision=precision.detach(),
                     role_recall=recall.detach(), role_f1=f1.detach(),
                     query_precision=q_precision.detach(),
                     query_recall=q_recall.detach(), query_f1=q_f1.detach(),
                     dynamic_valid_ratio=ratio.detach(),
                     ignored_ratio=ignored.detach(),
-                    unmatched_ratio=unmatched.detach())
+                    unmatched_ratio=unmatched.detach(),
+                    dynamic_unmatched_ratio=dynamic_unmatched.detach(),
+                    static_unmatched_ratio=static_unmatched.detach(),
+                    dynamic_gt_covered_ratio=dynamic_coverage.detach(),
+                    unique_gt_coverage_ratio=unique_coverage.detach())
 
-    def _loss_dynamic(self, cls_scores, output, cache, refine_pts_flat):
-        """Soft dynamic geometry loss with bidirectional nearest-neighbor coverage."""
+    def _loss_dynamic(self, cls_scores, output, cache, refine_pts_flat,
+                      return_diagnostics=False):
+        """GT-driven dynamic geometry and semantic supervision.
+
+        Only predictions carrying a valid GT-dynamic target participate in
+        prediction->GT coverage.  GT->prediction coverage remains independent
+        of predicted role probability, so a collapsed role router cannot
+        remove the geometry gradient; nearest-neighbor indexing naturally
+        limits that reverse gradient to the selected prediction points.
+        """
         if cache is None:
-            return refine_pts_flat.sum() * 0
-        pred_role = output['role_pred'].reshape(cls_scores.shape[0], -1)
-        total, count = refine_pts_flat.new_zeros(()), refine_pts_flat.new_zeros(())
+            zero = refine_pts_flat.sum() * 0
+            diagnostics = dict(
+                loss=zero, loss_dynamic_pred_to_gt=zero,
+                loss_dynamic_gt_to_pred=zero,
+                loss_dynamic_semantic=zero,
+                dynamic_pred_valid_ratio=zero.detach(),
+                dynamic_gt_covered_ratio=zero.detach())
+            return diagnostics if return_diagnostics else zero
+        cfg = getattr(self, 'dsqe_cfg', {})
+        beta = float(cfg.get('dynamic_huber_beta', 0.2))
+        max_distance = float(cfg.get('role_match_max_distance', 2.5))
+        pred_total = pred_count = refine_pts_flat.new_zeros(())
+        gt_total = gt_count = refine_pts_flat.new_zeros(())
+        dynamic_pred_count = total_pred_count = 0
+        dynamic_gt_count = dynamic_gt_covered = 0
+        cache_target = cache.get('role_target')
+        cache_valid = cache.get('role_valid')
         for b, gt_points in enumerate(cache.get('gt_points_list', [])):
             if gt_points.numel() == 0:
                 continue
@@ -713,33 +788,60 @@ class OPUSHead(BaseModule):
             pred_points = refine_pts_flat[b]
             if pred_points.numel() == 0:
                 continue
-            pred_to_gt = self._chunked_nearest_indices(pred_points,
-                                                       dynamic_points)
-            pred_error = (pred_points - dynamic_points[pred_to_gt]).abs().mean(-1)
-            # Dynamic geometry must remain supervised even while the role
-            # router is cold-started or temporarily collapsed to static.
-            # Predicted role probabilities are diagnostics/auxiliary signals,
-            # never the sole weight on this GT-driven coverage term.
-            pred_weight = torch.ones_like(pred_error)
-            total = total + (pred_error * pred_weight).sum()
-            count = count + pred_weight.sum()
+            total_pred_count += int(pred_points.shape[0])
+            if cache_target is not None and cache_valid is not None:
+                pred_dynamic = (
+                    cache_valid[b].reshape(-1).bool() &
+                    (cache_target[b].reshape(-1) > 0.5))
+                pred_dynamic = pred_dynamic[:pred_points.shape[0]]
+            else:
+                pred_dynamic = torch.zeros(
+                    pred_points.shape[0], device=pred_points.device,
+                    dtype=torch.bool)
+            dynamic_pred_points = pred_points[pred_dynamic]
+            dynamic_pred_count += int(pred_dynamic.sum())
+            if dynamic_pred_points.numel():
+                pred_to_gt = self._chunked_nearest_indices(
+                    dynamic_pred_points, dynamic_points)
+                pred_error = F.smooth_l1_loss(
+                    dynamic_pred_points, dynamic_points[pred_to_gt],
+                    reduction='none', beta=beta).mean(-1)
+                pred_total = pred_total + pred_error.sum()
+                pred_count = pred_count + pred_error.numel()
             # Reverse coverage prevents a cloud of easy predicted points from
-            # ignoring portions of a moving actor's future footprint.
-            gt_to_pred = self._chunked_nearest_indices(dynamic_points,
-                                                       pred_points)
-            gt_error = (dynamic_points - pred_points[gt_to_pred]).abs().mean(-1)
-            gt_weight = gt_role[dynamic].to(gt_error).clamp_min(1.0)
-            total = total + (gt_error * gt_weight).sum()
-            count = count + gt_weight.sum()
-        geometry = total / count.clamp_min(1.0)
+            # ignoring portions of a moving actor's future footprint.  This
+            # direction deliberately searches all predictions but only the
+            # selected nearest entries receive gradient.
+            gt_distances, gt_to_pred = OPUSHead._chunked_nearest(
+                dynamic_points, pred_points)
+            gt_error = F.smooth_l1_loss(
+                dynamic_points, pred_points[gt_to_pred], reduction='none',
+                beta=beta).mean(-1)
+            gt_total = gt_total + gt_error.sum()
+            gt_count = gt_count + gt_error.numel()
+            dynamic_gt_count += int(dynamic_points.shape[0])
+            dynamic_gt_covered += int((gt_distances <= max_distance).sum())
+        pred_geometry = pred_total / pred_count.clamp_min(1.0)
+        gt_geometry = gt_total / gt_count.clamp_min(1.0)
+        geometry = pred_geometry + gt_geometry
         # Absolute future semantics also receive a direct dynamic/static
         # classification signal.  This prevents geometry coverage alone from
         # being satisfied by a role route that never predicts actor classes.
         role_target = cache.get('role_target') if cache is not None else None
         role_valid = cache.get('role_valid') if cache is not None else None
+        semantic = geometry.new_zeros(())
         if role_target is None or role_valid is None:
-            return geometry
-        cfg = getattr(self, 'dsqe_cfg', {})
+            total_loss = geometry
+            diagnostics = dict(
+                loss=total_loss,
+                loss_dynamic_pred_to_gt=pred_geometry,
+                loss_dynamic_gt_to_pred=gt_geometry,
+                loss_dynamic_semantic=semantic,
+                dynamic_pred_valid_ratio=geometry.new_tensor(
+                    dynamic_pred_count / max(total_pred_count, 1)).detach(),
+                dynamic_gt_covered_ratio=geometry.new_tensor(
+                    dynamic_gt_covered / max(dynamic_gt_count, 1)).detach())
+            return diagnostics if return_diagnostics else total_loss
         dynamic_ids = cfg.get(
             'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10])
         static_ids = cfg.get(
@@ -762,10 +864,20 @@ class OPUSHead(BaseModule):
         cls_weight = torch.where(cls_target > 0.5,
                                  dynamic_weight.to(cls_bce),
                                  cls_bce.new_ones(()))
-        cls_loss = (cls_bce * cls_weight * cls_valid).sum() / \
+        semantic = (cls_bce * cls_weight * cls_valid).sum() / \
             cls_valid.sum().clamp_min(1.0)
-        return geometry + float(cfg.get(
-            'dynamic_semantic_weight', 0.25)) * cls_loss
+        total_loss = geometry + float(cfg.get(
+            'dynamic_semantic_weight', 0.25)) * semantic
+        diagnostics = dict(
+            loss=total_loss,
+            loss_dynamic_pred_to_gt=pred_geometry,
+            loss_dynamic_gt_to_pred=gt_geometry,
+            loss_dynamic_semantic=semantic,
+            dynamic_pred_valid_ratio=geometry.new_tensor(
+                dynamic_pred_count / max(total_pred_count, 1)).detach(),
+            dynamic_gt_covered_ratio=geometry.new_tensor(
+                dynamic_gt_covered / max(dynamic_gt_count, 1)).detach())
+        return diagnostics if return_diagnostics else total_loss
 
     def _loss_static(self, output, cache, refine_pts_flat):
         """Static-state temporal consistency plus weak occupancy coverage.
@@ -780,7 +892,7 @@ class OPUSHead(BaseModule):
         carried_metric = output.get('carried_evolved_metric')
         if target_metric is not None and carried_metric is not None:
             delta = (carried_metric - target_metric).abs().mean(-1)
-            role_cache = output.get('role_cache')
+            role_cache = output.get('current_role_cache')
             if role_cache is not None:
                 target = role_cache.get('role_target')
                 valid = role_cache.get('role_valid')

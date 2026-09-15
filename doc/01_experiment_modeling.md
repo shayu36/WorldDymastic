@@ -104,7 +104,9 @@ L = L_occ + λ_role L_role + λ_ego L_ego
 - `L_ego`：相邻 ego 平移/偏航监督；
 - `L_static`：只对 carried-static Query 约束上一状态经 GT ego warp 后的时序一致性，
   无历史的 new Query 不参与；
-- `L_dynamic`：动态 voxel 与预测点的双向 nearest-neighbor coverage，保留梯度；
+- `L_dynamic`：GT-confirmed dynamic prediction → dynamic GT 与 dynamic GT →
+  nearest prediction 的双向 coverage，采用 metric-space SmoothL1/Huber
+  （`dynamic_huber_beta=0.2`）；正向不吸引静态预测点，反向不依赖预测角色，且全程保留点梯度；
 - `L_smooth`：相邻时间 Query motion 增量连续性，并用 `motion_valid` 排除 new Query
   首次激活时的人为零运动；
 - `L_leak`：对 GT-static Query 抑制动态 Query-level motion 泄漏；dynamic semantic
