@@ -1108,16 +1108,16 @@ class SparseWorld4DTraj(OPUS):
 
     @staticmethod
     def _prescf_role_supervision_outputs(state):
-        """Expose route-time and next-state role predictions separately."""
-        route = dict(
+        """Expose pure current predictions and next-state roles separately."""
+        prediction = dict(
             role_logits=state['role_logits'],
             role_pred=state['role_pred'],
-            query_role=state['query_role'])
+            query_role=state['pred_query_role'])
         next_state = dict(
             role_logits=state['next_role_logits'],
             role_pred=state['next_role_pred'],
             query_role=state['next_query_role'])
-        return route, next_state
+        return prediction, next_state
 
     def loss_traj(self, pred_traj, gt_traj, ego_interval):
         loss_dict = dict()
@@ -1484,15 +1484,16 @@ class SparseWorld4DTraj(OPUS):
                 teacher_role=teacher_role, teacher_valid=teacher_valid,
                 teacher_forcing_ratio=(self.prescf_role_teacher_forcing
                                        if self.training else 0.0))
-            query_role = role['query_role']
+            pred_query_role = role['pred_query_role']
+            route_query_role = role['route_query_role']
 
             # Planning and ego motion read the dynamic/static Query views
             # independently.  The same fused context drives the sole pose
             # head; planning displacement is derived from its cumulative
             # transform below in the VAD LiDAR coordinate convention.
             ego_point = state_points.new_full((batch_size, 1, 3), 0.5)
-            dynamic_query_feat = query_role * conditioned_feat
-            static_query_feat = (1.0 - query_role) * conditioned_feat
+            dynamic_query_feat = route_query_role * conditioned_feat
+            static_query_feat = (1.0 - route_query_role) * conditioned_feat
             ego_dynamic, _ = self.ego_cross_attn_dynamic(
                 ego_point, ego_feat, state_points, dynamic_query_feat)
             ego_static, _ = self.ego_cross_attn_static(
@@ -1535,7 +1536,7 @@ class SparseWorld4DTraj(OPUS):
 
             evolved = self.dual_evolution(
                 conditioned_feat, state_points[:, :num_carried],
-                new_points, ego_context, query_role,
+                new_points, ego_context, route_query_role,
                 next_to_current, cumulative,
                 self.ego_warp)
             # Execute every PreSCF block in every stage so DDP observes a
@@ -1545,7 +1546,8 @@ class SparseWorld4DTraj(OPUS):
             # avoids ``find_unused_parameters=True`` being required merely
             # because of the curriculum.
             interaction = self.dual_interaction(
-                conditioned_feat, query_role, evolved['points_metric'])
+                conditioned_feat, route_query_role,
+                evolved['points_metric'])
             interaction_gate = interaction_stage_gate
             interaction_dynamic = dynamic_query_feat + interaction_gate * (
                 interaction['dynamic_feat'] - dynamic_query_feat)
@@ -1563,7 +1565,8 @@ class SparseWorld4DTraj(OPUS):
             correction_min_gate = float(self.dsqe_cfg.get(
                 'joint_correction_min_gate', 0.1))
             correction_gate = (correction_min_gate +
-                               (1.0 - correction_min_gate) * query_role).unsqueeze(2)
+                               (1.0 - correction_min_gate) *
+                               route_query_role).unsqueeze(2)
             final_metric = (evolved['points_metric'] +
                             correction_gate * joint['point_correction'])
             correction_scale = float(self.dsqe_cfg.get(
@@ -1650,7 +1653,10 @@ class SparseWorld4DTraj(OPUS):
             prescf_outputs.append(dict(
                 role=role,
                 role_logits=role['role_logits'], role_pred=role['role_pred'],
-                route_role=role['route_role'], query_role=role['query_role'],
+                pred_query_role=pred_query_role,
+                query_role=pred_query_role,
+                route_role=role['route_role'],
+                route_query_role=route_query_role,
                 next_role_logits=next_role_logits,
                 next_role_pred=next_role,
                 next_query_role=next_query_role,
@@ -1855,14 +1861,14 @@ class SparseWorld4DTraj(OPUS):
             for interval, state in enumerate(outputs['prescf_outputs'], 1):
                 current_role_cache, future_match_cache = \
                     self._prescf_supervision_caches(state)
-                route_role_output, next_role_output = \
+                pred_role_output, next_role_output = \
                     self._prescf_role_supervision_outputs(state)
                 # rho_t describes E_t/P_t/Z_t and is therefore supervised
                 # only by the current-state cache.  The cache generated from
                 # P_(t+1) supervises next_role and future geometry/semantics,
                 # but can never feed back into the target for route rho_t.
-                route_role_loss = (self.pts_bbox_head._loss_role(
-                                 route_role_output, current_role_cache)
+                pred_role_loss = (self.pts_bbox_head._loss_role(
+                                 pred_role_output, current_role_cache)
                              if current_role_cache is not None and hasattr(
                                  self.pts_bbox_head, '_loss_role') else
                              state['loss_role'])
@@ -1871,19 +1877,19 @@ class SparseWorld4DTraj(OPUS):
                                   if future_match_cache is not None and hasattr(
                                       self.pts_bbox_head, '_loss_role') else
                                   state['loss_role'] * 0)
-                role_loss = (route_role_loss +
+                role_loss = (pred_role_loss +
                              self.prescf_next_role_loss_weight *
                              next_role_loss)
                 losses['fu{}.loss_role'.format(interval)] = (
                     self.prescf_loss_weights['role'] * role_loss)
-                losses['fu{}.role_route_term'.format(interval)] = \
-                    route_role_loss.detach()
+                losses['fu{}.role_pred_term'.format(interval)] = \
+                    pred_role_loss.detach()
                 losses['fu{}.role_next_term'.format(interval)] = \
                     next_role_loss.detach()
                 if current_role_cache is not None and hasattr(
                         self.pts_bbox_head, '_role_metrics'):
                     for metric_name, metric_value in self.pts_bbox_head._role_metrics(
-                            route_role_output, current_role_cache).items():
+                            pred_role_output, current_role_cache).items():
                         losses['fu{}.{}'.format(interval, metric_name)] = metric_value
                 if future_match_cache is not None and hasattr(
                         self.pts_bbox_head, '_role_metrics'):

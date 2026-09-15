@@ -437,6 +437,60 @@ def test_query_role_gt_is_fixed_and_shared_across_losses_and_metrics():
     assert query_probability.grad is not None
 
 
+def test_teacher_role_changes_route_but_not_predicted_query_role():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_role_router import DSQERoleRouter
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    torch.manual_seed(11)
+    router = DSQERoleRouter(8, num_classes=17, hidden_dims=8)
+    feature = torch.randn(1, 2, 8)
+    points = torch.randn(1, 2, 4, 3)
+    semantics = torch.zeros(1, 2, 4, 17)
+    source = torch.zeros(1, 2, 1)
+    valid = torch.ones(1, 2, 4, 1, dtype=torch.bool)
+    static_teacher = torch.zeros(1, 2, 4, 1)
+    dynamic_teacher = torch.ones(1, 2, 4, 1)
+    static_route = router(
+        feature, points, semantics, source,
+        teacher_role=static_teacher, teacher_valid=valid,
+        teacher_forcing_ratio=1.0)
+    dynamic_route = router(
+        feature, points, semantics, source,
+        teacher_role=dynamic_teacher, teacher_valid=valid,
+        teacher_forcing_ratio=1.0)
+
+    assert torch.allclose(
+        static_route['pred_query_role'], dynamic_route['pred_query_role'])
+    assert torch.allclose(
+        static_route['route_query_role'], torch.zeros(1, 2, 1))
+    assert torch.allclose(
+        dynamic_route['route_query_role'], torch.ones(1, 2, 1))
+
+    cache = dict(
+        role_target=torch.tensor([[[1., 0., 1., 0.],
+                                   [0., 1., 0., 1.]]]),
+        role_valid=torch.ones(1, 2, 4, dtype=torch.bool))
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_dynamic_weight=1., role_focal_gamma=2.),
+        _masked_mean=OPUSHead._masked_mean)
+    pred_static = dict(
+        role_logits=static_route['role_logits'],
+        role_pred=static_route['role_pred'],
+        query_role=static_route['pred_query_role'])
+    pred_dynamic = dict(
+        role_logits=dynamic_route['role_logits'],
+        role_pred=dynamic_route['role_pred'],
+        query_role=dynamic_route['pred_query_role'])
+    assert torch.allclose(
+        OPUSHead._loss_role(fake, pred_static, cache),
+        OPUSHead._loss_role(fake, pred_dynamic, cache))
+    metrics_static = OPUSHead._role_metrics(pred_static, cache)
+    metrics_dynamic = OPUSHead._role_metrics(pred_dynamic, cache)
+    for name in ('query_precision', 'query_recall', 'query_f1'):
+        assert torch.equal(metrics_static[name], metrics_dynamic[name])
+
+
 def test_role_loss_uses_current_state_cache():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
@@ -493,7 +547,7 @@ def test_route_and_next_role_use_time_aligned_caches():
     state = dict(
         role_logits=torch.full((1, 1, 2, 1), -4.),
         role_pred=torch.full((1, 1, 2, 1), 0.02),
-        query_role=torch.full((1, 1, 1), 0.02),
+        pred_query_role=torch.full((1, 1, 1), 0.02),
         next_role_logits=torch.full((1, 1, 2, 1), 4.),
         next_role_pred=torch.full((1, 1, 2, 1), 0.98),
         next_query_role=torch.full((1, 1, 1), 0.98))
@@ -1360,6 +1414,11 @@ def test_six_step_prescf_rollout_recurses_and_backpropagates():
             batch, num_queries, points, 17)
         assert state['role_pred'].shape == (batch, num_queries, points, 1)
         assert state['query_role'].shape == (batch, num_queries, 1)
+        assert state['pred_query_role'].shape == (batch, num_queries, 1)
+        assert state['route_query_role'].shape == (batch, num_queries, 1)
+        # Inference never uses GT teacher forcing, so both views coincide.
+        assert torch.allclose(
+            state['pred_query_role'], state['route_query_role'])
         assert state['next_role_pred'].shape == (
             batch, num_queries, points, 1)
         assert state['next_query_role'].shape == (batch, num_queries, 1)

@@ -8,8 +8,9 @@ class DSQERoleRouter(nn.Module):
     """Predict point and query level dynamic probabilities.
 
     The router deliberately uses soft probabilities throughout.  A Query is
-    represented once; ``role_pred`` and ``query_role`` are two views of that
-    same state rather than two independent Query banks.
+    represented once; predicted and teacher-routed roles are separate views
+    of that same state rather than two independent Query banks.  Only the
+    routed view may contain GT teacher forcing.
     """
 
     def __init__(self, embed_dims, num_classes=17,
@@ -67,6 +68,7 @@ class DSQERoleRouter(nn.Module):
         role_logits = torch.logit(routing_prior, eps=self.eps) + self.role_head(context)
         role_pred = role_logits.sigmoid()
         pool_weights = self.pool_head(context).softmax(dim=2)
+        pred_query_role = (pool_weights * role_pred).sum(dim=2)
         route_role = role_pred
         if teacher_role is not None and teacher_forcing_ratio > 0:
             valid = (torch.ones_like(teacher_role, dtype=torch.bool)
@@ -74,8 +76,10 @@ class DSQERoleRouter(nn.Module):
             teacher_role = teacher_role.to(role_pred.dtype)
             blended = teacher_forcing_ratio * teacher_role + (1 - teacher_forcing_ratio) * role_pred
             route_role = torch.where(valid, blended, role_pred)
-        query_role = (pool_weights * route_role).sum(dim=2)
+        route_query_role = (pool_weights * route_role).sum(dim=2)
         return dict(semantic_prior=semantic_prior, routing_prior=routing_prior,
                     role_logits=role_logits, role_pred=role_pred,
-                    route_role=route_role, query_role=query_role,
+                    pred_query_role=pred_query_role,
+                    route_role=route_role,
+                    route_query_role=route_query_role,
                     pool_weights=pool_weights)
