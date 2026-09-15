@@ -53,6 +53,9 @@ model = dict(
         planar_motion_only=False,
         dynamic_semantic_weight=0.25,
         lambda_role=0.1,
+        # Joint-corrected rho_(t+1) receives its own future-cache role loss;
+        # rho_t remains supervised exclusively by the current-state cache.
+        next_role_loss_weight=1.0,
         lambda_ego=0.1,
         lambda_static=0.01,
         lambda_dynamic=0.01,

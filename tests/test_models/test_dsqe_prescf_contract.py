@@ -484,6 +484,52 @@ def test_future_point_perturbation_does_not_change_current_role_target():
     assert torch.equal(cache_a['role_valid'], cache_b['role_valid'])
 
 
+def test_route_and_next_role_use_time_aligned_caches():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    # The same Query is static at t and dynamic at t+1.
+    state = dict(
+        role_logits=torch.full((1, 1, 2, 1), -4.),
+        role_pred=torch.full((1, 1, 2, 1), 0.02),
+        query_role=torch.full((1, 1, 1), 0.02),
+        next_role_logits=torch.full((1, 1, 2, 1), 4.),
+        next_role_pred=torch.full((1, 1, 2, 1), 0.98),
+        next_query_role=torch.full((1, 1, 1), 0.98))
+    current = dict(
+        role_target=torch.zeros(1, 1, 2),
+        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
+    future = dict(
+        role_target=torch.ones(1, 1, 2),
+        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
+    route_output, next_output = \
+        SparseWorld4DTraj._prescf_role_supervision_outputs(state)
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_dynamic_weight=1., role_focal_gamma=2.),
+        _masked_mean=OPUSHead._masked_mean)
+    route_loss = OPUSHead._loss_role(fake, route_output, current)
+    next_loss = OPUSHead._loss_role(fake, next_output, future)
+    assert route_loss < OPUSHead._loss_role(fake, route_output, future)
+    assert next_loss < OPUSHead._loss_role(fake, next_output, current)
+
+    # Each prediction is a pure function of its own time-aligned cache.
+    changed_future = dict(
+        role_target=torch.zeros_like(future['role_target']),
+        role_valid=future['role_valid'])
+    changed_current = dict(
+        role_target=torch.ones_like(current['role_target']),
+        role_valid=current['role_valid'])
+    assert torch.equal(
+        route_loss, OPUSHead._loss_role(fake, route_output, current))
+    assert torch.equal(
+        next_loss, OPUSHead._loss_role(fake, next_output, future))
+    assert not torch.equal(
+        next_loss, OPUSHead._loss_role(fake, next_output, changed_future))
+    assert not torch.equal(
+        route_loss, OPUSHead._loss_role(fake, route_output, changed_current))
+
+
 def test_unmatched_ratio_uses_unique_thresholded_gt_coverage():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
@@ -1314,6 +1360,9 @@ def test_six_step_prescf_rollout_recurses_and_backpropagates():
             batch, num_queries, points, 17)
         assert state['role_pred'].shape == (batch, num_queries, points, 1)
         assert state['query_role'].shape == (batch, num_queries, 1)
+        assert state['next_role_pred'].shape == (
+            batch, num_queries, points, 1)
+        assert state['next_query_role'].shape == (batch, num_queries, 1)
         assert state['query_motion'].shape == (batch, num_queries, 3)
         expected_semantics = model.joint_refine.predict_semantics(
             state['joint_feat'], state['points_metric'])
@@ -1328,6 +1377,9 @@ def test_six_step_prescf_rollout_recurses_and_backpropagates():
             following['input_points'][:, :count])
         assert torch.allclose(
             previous['semantics'], following['input_semantics'][:, :count])
+        assert torch.allclose(
+            previous['next_role_pred'],
+            following['role_prior'][:, :count])
 
     loss = sum(state['points_metric'].square().mean()
                + state['semantics'].square().mean()
