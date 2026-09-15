@@ -182,6 +182,11 @@ class SparseWorld4DTraj(OPUS):
             'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10]))
         self.static_class_ids = tuple(cfg.get(
             'static_class_ids', [1, 8, 11, 12, 13, 14, 15, 16]))
+        self.prescf_actor_recovery_max_distance = float(cfg.get(
+            'actor_recovery_max_distance',
+            cfg.get('role_match_max_distance', 2.5)))
+        if self.prescf_actor_recovery_max_distance <= 0:
+            raise ValueError('actor_recovery_max_distance must be positive')
         self.role_router = DSQERoleRouter(
             self.out_dim, num_classes=17,
             dynamic_class_ids=self.dynamic_class_ids,
@@ -958,7 +963,8 @@ class SparseWorld4DTraj(OPUS):
         return query_actor_id
 
     @classmethod
-    def _initialize_actor_association(cls, points_metric, metadata):
+    def _initialize_actor_association(
+            cls, points_metric, metadata, max_distance=None):
         """Associate newly activated Query points with GT dynamic actors.
 
         The association is created once from the actor's inflated footprint
@@ -987,6 +993,8 @@ class SparseWorld4DTraj(OPUS):
                 distance = torch.cdist(points[:, :2], centers[:, :2])
                 nearest, index = distance.min(dim=1)
                 matched = (nearest <= radius[index]) & valid[index]
+                if max_distance is not None:
+                    matched &= nearest <= float(max_distance)
                 dims, yaw = actors.get('dims'), actors.get('yaw')
                 if dims is not None and yaw is not None:
                     dims = dims.to(points_metric).abs()
@@ -1010,6 +1018,36 @@ class SparseWorld4DTraj(OPUS):
             point_actor_id=point_actor_id,
             query_actor_id=cls._query_actor_ids(point_actor_id),
             actor_valid=actor_valid)
+
+    @classmethod
+    def _recover_actor_association(
+            cls, point_actor_id, points_metric, metadata, max_distance):
+        """Persist newly reliable actor matches without rewriting identity.
+
+        Reverse dynamic coverage may bring a previously-unmatched point into
+        a valid actor footprint.  Such a point can acquire an association at
+        its first reliable recovery, while every existing ID remains
+        immutable even if later geometry drifts or another actor is nearer.
+        """
+        if tuple(point_actor_id.shape) != tuple(points_metric.shape[:3]):
+            raise ValueError(
+                'actor association shape {} does not match points {}'.format(
+                    tuple(point_actor_id.shape),
+                    tuple(points_metric.shape[:3])))
+        if float(max_distance) <= 0:
+            raise ValueError('actor recovery max distance must be positive')
+        candidate = cls._initialize_actor_association(
+            points_metric, metadata, max_distance=max_distance)
+        recovered_mask = ((point_actor_id < 0) &
+                          candidate['actor_valid'])
+        updated = torch.where(
+            recovered_mask, candidate['point_actor_id'], point_actor_id)
+        actor_valid = cls._refresh_actor_association(updated, metadata)
+        return dict(
+            point_actor_id=updated,
+            query_actor_id=cls._query_actor_ids(updated),
+            actor_valid=actor_valid,
+            recovered_mask=recovered_mask)
 
     @staticmethod
     def _refresh_actor_association(point_actor_id, metadata):
@@ -1358,6 +1396,7 @@ class SparseWorld4DTraj(OPUS):
                 state_point_actor_id, current_metadata)
             current_query_actor_id = self._query_actor_ids(
                 state_point_actor_id)
+            input_point_actor_id = state_point_actor_id.clone()
             source = state_points.new_zeros(batch_size, num_carried + num_new, 1)
             source[:, :num_carried] = 1
             activation = torch.cat([
@@ -1528,6 +1567,8 @@ class SparseWorld4DTraj(OPUS):
             forecast_points.append(final_points)
             forecast_semantics.append(semantics)
             match_cache = None
+            future_metadata = (role_metadata_at(interval + 1)
+                               if self.training else None)
             temporal_semantics = kwargs.get('temporal_semantics')
             if self.training and temporal_semantics is not None and \
                     hasattr(self.pts_bbox_head, 'build_future_match_cache'):
@@ -1539,18 +1580,19 @@ class SparseWorld4DTraj(OPUS):
                 if isinstance(future, dict):
                     future = future.get('voxel_semantics')
                 if future is not None:
-                    metadata = role_metadata_at(interval + 1)
                     match_cache = self.pts_bbox_head.build_future_match_cache(
-                        final_points, future, role_metadata=metadata)
-                    match_cache = self._apply_actor_association_to_role_cache(
-                        match_cache, state_point_actor_id, metadata)
+                        final_points, future,
+                        role_metadata=future_metadata)
+            recovery = self._recover_actor_association(
+                state_point_actor_id, final_metric, future_metadata,
+                max_distance=self.prescf_actor_recovery_max_distance)
+            state_point_actor_id = recovery['point_actor_id']
+            if match_cache is not None:
+                match_cache = self._apply_actor_association_to_role_cache(
+                    match_cache, state_point_actor_id, future_metadata)
             match_cache_list.append(match_cache)
-            future_metadata = (role_metadata_at(interval + 1)
-                               if self.training else None)
-            future_actor_valid = self._refresh_actor_association(
-                state_point_actor_id, future_metadata)
-            future_query_actor_id = self._query_actor_ids(
-                state_point_actor_id)
+            future_actor_valid = recovery['actor_valid']
+            future_query_actor_id = recovery['query_actor_id']
             role_loss = final_metric.new_zeros(())
             dynamic_loss = final_metric.new_zeros(())
             static_loss = final_metric.new_zeros(())
@@ -1598,7 +1640,7 @@ class SparseWorld4DTraj(OPUS):
                 gt_pose_target=(gt_pose.detach() if gt_pose is not None else None),
                 input_feat=state_feat, input_points=state_points,
                 input_semantics=state_semantics,
-                input_point_actor_id=state_point_actor_id,
+                input_point_actor_id=input_point_actor_id,
                 input_query_actor_id=current_query_actor_id,
                 current_actor_valid=current_actor_valid,
                 points_metric=final_metric, evolved_points_metric=evolved['points_metric'],
@@ -1614,6 +1656,7 @@ class SparseWorld4DTraj(OPUS):
                 point_actor_id=state_point_actor_id,
                 query_actor_id=future_query_actor_id,
                 actor_valid=future_actor_valid,
+                actor_recovered_mask=recovery['recovered_mask'],
                 pool_weights=role['pool_weights']))
             state_feat, state_points, state_semantics = (
                 joint['query_feat'], final_points, semantics)

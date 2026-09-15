@@ -385,6 +385,58 @@ def test_role_loss_is_class_balanced_focal_and_reports_f1():
     assert metrics['dynamic_valid_ratio'] == 0.25
 
 
+def test_query_role_gt_is_fixed_and_shared_across_losses_and_metrics():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    point_target = torch.tensor(
+        [[[1., 0.], [0., 0.]]], requires_grad=True)
+    cache = dict(
+        role_target=point_target,
+        role_valid=torch.ones(1, 2, 2, dtype=torch.bool),
+        # Association is authoritative: Query 1 is dynamic even though its
+        # current point labels are both zero.
+        query_actor_id=torch.tensor([[-1, 3]]),
+        actor_valid=torch.ones(1, 2, 2, dtype=torch.bool))
+    query_target, query_valid = OPUSHead._query_role_targets(cache)
+    assert torch.equal(query_target, torch.tensor([[0.5, 1.0]]))
+    assert query_valid.all()
+    assert not query_target.requires_grad and not query_valid.requires_grad
+
+    fake = SimpleNamespace(
+        dsqe_cfg=dict(role_dynamic_weight=1., role_focal_gamma=2.),
+        _masked_mean=OPUSHead._masked_mean)
+    query_probability = torch.full(
+        (1, 2, 1), 0.4, requires_grad=True)
+    output_a = dict(
+        role_logits=torch.zeros(1, 2, 2, 1, requires_grad=True),
+        query_role=query_probability,
+        pool_weights=torch.tensor([[[[0.99], [0.01]],
+                                    [[0.99], [0.01]]]]))
+    output_b = dict(
+        role_logits=output_a['role_logits'],
+        query_role=query_probability,
+        pool_weights=1.0 - output_a['pool_weights'])
+    loss_a = OPUSHead._loss_role(fake, output_a, cache)
+    loss_b = OPUSHead._loss_role(fake, output_b, cache)
+    assert torch.allclose(loss_a, loss_b)
+    assert OPUSHead._role_metrics(output_a, cache)['query_f1'] == \
+        OPUSHead._role_metrics(output_b, cache)['query_f1']
+
+    motion = torch.tensor([[[1., 0., 0.], [2., 0., 0.]]],
+                          requires_grad=True)
+    leak_a = OPUSHead._loss_leak(
+        fake, dict(output_a, query_motion=motion,
+                   motion_valid=torch.ones(1, 2, 1, dtype=torch.bool)), cache)
+    leak_b = OPUSHead._loss_leak(
+        fake, dict(output_b, query_motion=motion,
+                   motion_valid=torch.ones(1, 2, 1, dtype=torch.bool)), cache)
+    assert torch.allclose(leak_a, leak_b)
+    (loss_a + leak_a).backward()
+    assert point_target.grad is None
+    assert query_probability.grad is not None
+
+
 def test_role_loss_uses_current_state_cache():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
@@ -825,6 +877,38 @@ def test_actor_invalidity_masks_future_role_supervision():
     assert future['role_target'].eq(1).all()
     assert not future['role_valid'].any()  # supervision follows future validity
     assert not future['actor_valid'].any()
+
+
+def test_recovered_actor_association_persists_without_overwrite():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    metadata = _association_metadata(torch)
+    # A small/unobserved actor has no point in its footprint at activation.
+    activation = torch.tensor([[[[5., 5., 0.], [6., 5., 0.]]]])
+    association = SparseWorld4DTraj._initialize_actor_association(
+        activation, metadata)
+    assert association['point_actor_id'].eq(-1).all()
+
+    # Reverse dynamic coverage can move one point into actor 0's footprint.
+    recovered_geometry = torch.tensor(
+        [[[[0.5, 0., 0.], [6., 5., 0.]]]])
+    recovered = SparseWorld4DTraj._recover_actor_association(
+        association['point_actor_id'], recovered_geometry, metadata,
+        max_distance=2.5)
+    assert recovered['point_actor_id'].tolist() == [[[0, -1]]]
+    assert recovered['recovered_mask'].tolist() == [[[True, False]]]
+
+    persistent = recovered['point_actor_id']
+    # Even when the recovered point later drifts onto actor 1, its existing
+    # actor-0 identity is immutable; only still-unassociated points may fill.
+    for _ in range(6):
+        drifted = torch.tensor([[[[10., 0., 0.], [20., 20., 0.]]]])
+        next_state = SparseWorld4DTraj._recover_actor_association(
+            persistent, drifted, metadata, max_distance=2.5)
+        assert next_state['point_actor_id'][0, 0, 0].item() == 0
+        assert not next_state['recovered_mask'][0, 0, 0]
+        persistent = next_state['point_actor_id']
 
 
 def test_shared_ego_pose_is_exported_in_vad_lidar_planning_frame():

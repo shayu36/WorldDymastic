@@ -622,10 +622,45 @@ class OPUSHead(BaseModule):
             mask = mask.unsqueeze(-1)
         return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
+    @staticmethod
+    def _query_role_targets(cache):
+        """Build fixed Query-level GT without learned pooling weights.
+
+        A persistent actor association is authoritative for dynamic Queries.
+        Unassociated Queries fall back to the unweighted mean of their valid
+        point labels.  Actor future invalidity masks the associated Query
+        instead of changing its identity or turning it into a static target.
+        Both outputs are detached supervision tensors shared by role loss,
+        metrics and motion-leak regularization.
+        """
+        target = cache['role_target'].detach()
+        valid = cache['role_valid'].detach().bool()
+        gt_weights = valid.to(target.dtype)
+        query_target = (
+            (gt_weights * target).sum(dim=2) /
+            gt_weights.sum(dim=2).clamp_min(1.0))
+        query_valid = valid.any(dim=2)
+
+        query_actor_id = cache.get('query_actor_id')
+        if query_actor_id is not None:
+            query_actor_id = query_actor_id.to(target.device).detach()
+            associated = query_actor_id >= 0
+            actor_valid = cache.get('actor_valid')
+            if actor_valid is None:
+                associated_valid = associated
+            else:
+                associated_valid = actor_valid.to(
+                    target.device).detach().bool().any(dim=2)
+            query_target = torch.where(
+                associated, torch.ones_like(query_target), query_target)
+            query_valid = torch.where(
+                associated, associated_valid, query_valid)
+        return query_target.detach(), query_valid.detach()
+
     def _loss_role(self, output, cache):
         logits = output['role_logits'].squeeze(-1)
-        target = cache['role_target'].to(logits.dtype)
-        valid = cache['role_valid']
+        target = cache['role_target'].to(logits.dtype).detach()
+        valid = cache['role_valid'].detach().bool()
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
         cfg = getattr(self, 'dsqe_cfg', {})
         gamma = float(cfg.get('role_focal_gamma', 2.0))
@@ -644,13 +679,11 @@ class OPUSHead(BaseModule):
                               dynamic_weight,
                               logits.new_tensor(1.0))
         point_loss = self._masked_mean(bce * focal * weights, valid)
-        pool = output.get('pool_weights')
         query = output.get('query_role')
-        if pool is None or query is None:
+        if query is None:
             return point_loss
-        weights = pool.squeeze(-1) * valid.to(pool.dtype)
-        q_target = (weights * target).sum(2) / weights.sum(2).clamp_min(1e-6)
-        q_valid = valid.any(2)
+        q_target, q_valid = OPUSHead._query_role_targets(cache)
+        q_target = q_target.to(query)
         q_bce = F.binary_cross_entropy(
             query.squeeze(-1).clamp(1e-5, 1 - 1e-5), q_target,
             reduction='none')
@@ -667,8 +700,8 @@ class OPUSHead(BaseModule):
     def _role_metrics(output, cache):
         """Return point/query role quality and matching diagnostics."""
         logits = output['role_logits'].squeeze(-1)
-        target = cache['role_target'].to(logits.dtype)
-        valid = cache['role_valid'].bool()
+        target = cache['role_target'].to(logits.dtype).detach()
+        valid = cache['role_valid'].detach().bool()
         zero = logits.new_zeros(())
         pred = logits.sigmoid() >= 0.5
         positive = target >= 0.5
@@ -680,13 +713,10 @@ class OPUSHead(BaseModule):
         f1 = 2 * precision * recall / (precision + recall).clamp_min(1e-6)
         ratio = ((positive & valid).sum().to(logits.dtype) /
                  valid.sum().clamp_min(1))
-        pool = output.get('pool_weights')
         query = output.get('query_role')
-        if pool is not None and query is not None:
-            pool = pool.squeeze(-1).to(logits.dtype)
-            q_weight = pool * valid.to(logits.dtype)
-            q_target = (q_weight * target).sum(-1) / q_weight.sum(-1).clamp_min(1e-6)
-            q_valid = valid.any(-1)
+        if query is not None:
+            q_target, q_valid = OPUSHead._query_role_targets(cache)
+            q_target = q_target.to(logits)
             q_pred = query.squeeze(-1) >= 0.5
             q_positive = q_target >= 0.5
             q_tp = (q_pred & q_positive & q_valid).sum().to(logits.dtype)
@@ -963,15 +993,11 @@ class OPUSHead(BaseModule):
             return reference.sum() * 0
         target = cache.get('role_target')
         valid = cache.get('role_valid')
-        pool = output.get('pool_weights')
-        if target is None or valid is None or pool is None:
+        if target is None or valid is None:
             return motion.sum() * 0
-        target = target.to(motion.dtype)
-        valid = valid.to(motion.dtype)
-        pool = pool.squeeze(-1).to(motion.dtype)
-        static_weight = pool * (1.0 - target) * valid
-        static_query = static_weight.sum(-1) / (
-            pool.mul(valid).sum(-1).clamp_min(1e-6))
+        query_target, query_valid = OPUSHead._query_role_targets(cache)
+        static_query = ((1.0 - query_target.to(motion)) *
+                        query_valid.to(motion.dtype))
         motion_valid = output.get('motion_valid')
         if motion_valid is not None:
             static_query = static_query * motion_valid.squeeze(-1).to(
