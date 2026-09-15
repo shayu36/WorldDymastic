@@ -111,23 +111,28 @@ L = L_occ + λ_role L_role + λ_ego L_ego
   auxiliary BCE 直接读取未来绝对语义头的 dynamic logit。
 
 Stage 1（epoch 0–4）冻结 Backbone、RAP/TASS 及 BaseLine SCF/Planning heads，训练
-role、pose、双流演化和 absolute semantic head，并保持单步预测。interaction/joint
-correction 在 identity blend 中执行，
-从而保留完整 DDP 参数图；这里不复用 BaseLine 的 `pretrain=True`，因此 future OCC
-和 absolute semantic head 从第一个 epoch 就有梯度。Stage 2 从 epoch 5 开始增加预测步数（2→3→…→6），
-role/pose teacher forcing 同步线性衰减到预测闭环。Stage 3 可通过
+role、pose、双流演化、dual interaction、joint refine 和 absolute semantic head，并保持
+单步预测。interaction/joint correction 从 `stage_gate_floor=0.1` 的正值开始执行，
+不会用精确 0 的 gate 切断预期模块梯度，同时仍接近 BaseLine 恒等状态。这里不复用
+BaseLine 的 `pretrain=True`，因此 future OCC 和 absolute semantic head 从第一个 epoch
+就有梯度。Stage 2 从 epoch 5 开始按显式 `forecast_curriculum=[1,2,3,6]` 增加预测步数，
+role/pose teacher forcing 使用独立比例并线性衰减到预测闭环。Stage 3 可通过
 `stage3_start_epoch` 解冻 TASS decoder 最后若干层，
 其 optimizer learning rate 为主学习率的 0.1 倍。为兼容 DDP 的一次性 reducer，待解冻层
 从初始化开始就加入 DDP/optimizer；Stage 1/2 通过梯度门置零且关闭该参数组 weight decay，
 Stage 3 再打开梯度门，因此冻结期参数不会被 AdamW 暗中更新。
-interaction 与 joint feature path 分别从 Stage 2、Stage 3 起用 4 个 epoch 从 identity
-线性升到完整输出，避免随机新分支在阶段边界造成递归状态突变。
+interaction 与 joint feature path 的正门控在阶段边界平滑升到完整输出，避免随机新分支
+造成递归状态突变。`DSQEDualEvolution` 的 motion head 从 ego warp 前的 `P_t` 做
+Query-level pooling；点级动态修正默认输出完整 xyz，只有显式配置
+`planar_motion_only=True` 才会约束 z 分量。
 
 Planning 与 ego pose 不再使用两套平移头。pose head 递归输出相邻 ego 变换，随后通过
 LiDAR 外参将累计 `T(E_t→E_0)` 共轭为 `T(L_t→L_0)`；相邻 LiDAR 原点之差作为 VAD
 planning 输出。这样共享同一个平移状态，同时不会把 ego-frame xy 直接与 E0-LiDAR
 坐标下的 planning GT 错配。
-absolute semantic head 在加载 BaseLine checkpoint 时从对应分类头 warm-start。
+absolute semantic head 在加载 BaseLine checkpoint 时从对应分类头 warm-start。它逐层复制
+BaseLine 的 `Linear→ReLU→Linear→ReLU→Linear(48×17)`，不平均最后一层；坐标 adapter
+的最终投影零初始化，保持初始函数等价但仍可在训练中获得梯度。
 
 ## 6. 运行入口与限制
 
@@ -150,9 +155,15 @@ bash tools/train_dsqe_project.sh
 /data/jxy/projects/env/bin/python3.9 -m pytest -q \
   tests/test_models/test_dsqe_prescf_contract.py
 
-# 两张 GPU、默认 200 iteration 的无数据集 DDP smoke
+# 两张 GPU、默认 200 iteration 的真实 forward_train DDP smoke（合成 batch，非 surrogate loss）
 /data/jxy/projects/env/bin/torchrun --nproc_per_node=2 \
   tools/test_prescf_ddp_smoke.py
+
+# 分别检查 Stage 2 和 Stage 3 的 teacher-forcing/解冻路径
+/data/jxy/projects/env/bin/torchrun --nproc_per_node=2 \
+  tools/test_prescf_ddp_smoke.py --stage 2
+/data/jxy/projects/env/bin/torchrun --nproc_per_node=2 \
+  tools/test_prescf_ddp_smoke.py --stage 3
 ```
 
 测试套件包含真实 PyTorch/CUDA 六步 Query-state rollout、递归恒等与各 PreSCF 模块

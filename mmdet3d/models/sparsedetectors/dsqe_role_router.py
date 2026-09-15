@@ -34,6 +34,7 @@ class DSQERoleRouter(nn.Module):
         self.pool_head = nn.Sequential(
             nn.Linear(hidden_dims, hidden_dims), nn.ReLU(inplace=True),
             nn.Linear(hidden_dims, 1))
+        nn.init.zeros_(self.source_embed.weight)
         nn.init.zeros_(self.role_head[-1].weight)
         nn.init.zeros_(self.role_head[-1].bias)
 

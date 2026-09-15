@@ -27,17 +27,57 @@ class DSQEJointRefine(nn.Module):
             nn.Linear(embed_dims, embed_dims), nn.ReLU(inplace=True),
             nn.Linear(embed_dims, 3))
         self.role_correction = nn.Linear(embed_dims, 1)
-        self.semantic_head = nn.Linear(embed_dims, num_classes)
+        self.num_points = int(num_points)
+        self.num_classes = int(num_classes)
+        # Keep the same three-layer MLP topology as SparseWorld's trained
+        # BaseLine ``cls_branch``.  Its final projection contains an
+        # independent classifier for every refine point, so averaging that
+        # projection would not be function-preserving.  The complete MLP is
+        # copied layer-for-layer by ``SparseWorld4DTraj._load_from_state_dict``
+        # when a BaseLine checkpoint is loaded.
+        self.semantic_head = nn.Sequential(
+            nn.Linear(embed_dims, embed_dims), nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims), nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, self.num_points * self.num_classes))
+        # Coordinates are an additive, point-conditioned adapter.  Its final
+        # projection starts at zero, so the adapter is an exact identity
+        # warm-start while its parameters still receive gradients (a zero
+        # multiplicative gate would cut those gradients in Stage 1).
+        self.point_adapter = nn.Sequential(
+            nn.Linear(3, embed_dims), nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True), nn.Linear(embed_dims, num_classes))
+        self.point_adapter_gate = nn.Parameter(torch.ones(()))
         nn.init.zeros_(self.point_correction[-1].weight)
         nn.init.zeros_(self.point_correction[-1].bias)
         nn.init.zeros_(self.role_correction.weight)
         nn.init.zeros_(self.role_correction.bias)
+        nn.init.zeros_(self.point_adapter[-1].weight)
+        nn.init.zeros_(self.point_adapter[-1].bias)
 
-    def predict_semantics(self, query_feat, points_metric, point_features=None):
-        """Predict absolute logits from the corrected feature/point state."""
-        if point_features is None:
-            point_features = query_feat.unsqueeze(2) + self.point_proj(points_metric)
-        return self.semantic_head(point_features)
+    def predict_semantics(self, query_feat, points_metric, point_features=None,
+                          use_point_adapter=True):
+        """Predict absolute logits from the current Query/point state.
+
+        ``semantic_head`` is deliberately evaluated only on ``E_joint`` and
+        reshaped into the 48 point slots.  ``points_metric`` enters through a
+        separately gated adapter, which makes the new head point-aware while
+        preserving exact BaseLine outputs at initialization (the adapter's
+        final projection is zero-initialized).
+        No previous-time logits or BaseLine future logits are consumed here.
+        """
+        if query_feat.ndim != 3 or points_metric.ndim != 4:
+            raise ValueError('query_feat must be [B,N,C] and points_metric '
+                             'must be [B,N,P,3]')
+        batch, queries, points = points_metric.shape[:3]
+        if points != self.num_points:
+            raise ValueError('expected {} refine points, got {}'.format(
+                self.num_points, points))
+        base = self.semantic_head(query_feat).reshape(
+            batch, queries, self.num_points, self.num_classes)
+        if not use_point_adapter:
+            return base
+        adapter = self.point_adapter(points_metric)
+        return base + self.point_adapter_gate * adapter
 
     def _local_spatial_attention(self, module, query, centers):
         """Exchange state across nearest Queries without dense N² attention."""
@@ -68,7 +108,7 @@ class DSQEJointRefine(nn.Module):
                             points_metric.shape[2], 1),
                         semantic_logits=points_metric.new_zeros(
                             points_metric.shape[0], points_metric.shape[1],
-                            points_metric.shape[2], self.semantic_head.out_features))
+                            points_metric.shape[2], self.num_classes))
         center = points_metric.mean(2)
         joint = self.norm(base_feat + self.dynamic_proj(dynamic_feat) + self.static_proj(static_feat) + self.point_proj(center))
         joint = self.norm(joint + self.ffn(joint))

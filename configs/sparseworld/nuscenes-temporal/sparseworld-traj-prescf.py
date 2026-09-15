@@ -1,12 +1,16 @@
 """DSQE-PreSCF training configuration.
 
-The BaseLine configuration remains untouched and can be used for checkpoint
-and metric comparisons.  PreSCF replaces the future SCF recursion with a
-single carried/new Query state updated by the role, warp, evolution,
+The BaseLine execution path remains independent and can be used for
+checkpoint/metric comparisons.  PreSCF replaces the future SCF recursion with
+a single carried/new Query state updated by the role, warp, evolution,
 interaction and joint-refinement modules.
 """
 
-_base_ = ['./sparseworld-traj-baseline.py']
+# PreSCF needs the actor-only supervision fields that the pure BaseLine
+# reference deliberately omits.  Both configurations still share the same
+# model/data definitions from the finetune base, while the execution mode is
+# selected explicitly below.
+_base_ = ['./sparseworld-traj-finetune.py']
 
 model = dict(
     dsqe_mode='prescf',
@@ -16,6 +20,7 @@ model = dict(
         dynamic_class_ids=[2, 3, 4, 5, 6, 7, 9, 10],
         static_class_ids=[1, 8, 11, 12, 13, 14, 15, 16],
         forecast_steps=None,
+        forecast_curriculum=[1, 2, 3, 6],
         # Stage 1 starts with GT-routed roles/ego transforms and linearly
         # decays both signals to fully predicted closed-loop rollout.
         teacher_forcing=1.0,
@@ -38,6 +43,8 @@ model = dict(
         role_dynamic_weight='auto',
         role_dynamic_weight_max=20.0,
         role_focal_gamma=2.0,
+        role_match_max_distance=2.5,
+        planar_motion_only=False,
         dynamic_semantic_weight=0.25,
         lambda_role=0.1,
         lambda_ego=0.1,
@@ -49,6 +56,7 @@ model = dict(
         stage2_end_epoch=16,
         interaction_ramp_epochs=4,
         joint_ramp_epochs=4,
+        stage_gate_floor=0.1,
         joint_correction_min_gate=0.1,
         freeze_backbone=True,
         freeze_baseline_heads=True,

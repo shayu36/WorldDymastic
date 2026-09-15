@@ -13,6 +13,102 @@ def test_baseline_and_prescf_configs_are_separate():
     assert baseline.exists() and prescf.exists()
     assert "dsqe_mode='baseline'" in baseline.read_text()
     assert "dsqe_mode='prescf'" in prescf.read_text()
+    from mmcv import Config
+    baseline_cfg = Config.fromfile(str(baseline))
+    prescf_cfg = Config.fromfile(str(prescf))
+    assert 'temporal_agent_boxes' not in baseline_cfg.train_pipeline[-1]['keys']
+    assert 'temporal_agent_boxes' in prescf_cfg.train_pipeline[-1]['keys']
+
+
+def test_baseline_mode_numeric_identity_for_same_checkpoint_and_input():
+    """The reference and explicitly-disabled PreSCF configs are identical.
+
+    This exercises the actual detector's BaseLine future path rather than
+    relying on source-string checks.  It is GPU-gated because OPUSHead's
+    legacy voxel helpers allocate CUDA buffers during construction.
+    """
+    torch = pytest.importorskip('torch')
+    if not torch.cuda.is_available():
+        pytest.skip('CUDA is required for detector numeric identity test')
+    from mmcv import Config
+    from mmdet3d.models import build_model
+
+    root = Path(__file__).parents[2]
+    baseline_cfg = Config.fromfile(str(
+        root / 'configs/sparseworld/nuscenes-temporal/'
+        'sparseworld-traj-baseline.py'))
+    prescf_cfg = Config.fromfile(str(
+        root / 'configs/sparseworld/nuscenes-temporal/'
+        'sparseworld-traj-prescf.py'))
+    # Force the second config into the reference execution mode while
+    # retaining its PreSCF data/config namespace.
+    prescf_cfg.model.dsqe_mode = 'baseline'
+    prescf_cfg.model.dsqe_cfg = dict(enabled=False, mode='baseline')
+
+    device = torch.device('cuda')
+    model_a = build_model(baseline_cfg.model,
+                          train_cfg=baseline_cfg.get('train_cfg'),
+                          test_cfg=baseline_cfg.get('test_cfg')).to(device).eval()
+    num_queries = model_a.num_query + sum(model_a.num_fu_query)
+    stamps = torch.cat([
+        torch.zeros(model_a.num_query, dtype=torch.long),
+        *[torch.full((count,), index, dtype=torch.long)
+          for index, count in enumerate(model_a.num_fu_query, 1)]
+    ]).to(device)
+    model_a.pts_bbox_head.ind_stamps_all = stamps
+    generator = torch.Generator(device=device).manual_seed(123)
+    outs = dict(
+        query_feat=torch.randn(1, num_queries, model_a.out_dim,
+                               generator=generator, device=device),
+        all_refine_pts=[torch.rand(
+            1, num_queries, model_a.num_refines, 3,
+            generator=generator, device=device)],
+        all_cls_scores=[torch.randn(
+            1, num_queries, model_a.num_refines, 17,
+            generator=generator, device=device)])
+    ego_feat = torch.randn(1, 1, model_a.out_dim,
+                           generator=generator, device=device)
+    with torch.no_grad():
+        output_a = model_a._forward_baseline_scf(outs, ego_feat, [{}], {})
+    expected = dict(
+        cls_score=output_a['cls_score'].detach().cpu(),
+        refine_pts=output_a['refine_pts'].detach().cpu(),
+        forecast_points=[item.detach().cpu()
+                         for item in output_a['forecast_points_list']],
+        forecast_semantics=[item.detach().cpu()
+                            for item in output_a['forecast_semantics_list']],
+        pred_trajs=[item.detach().cpu()
+                    for item in output_a['pred_trajs_list']])
+    checkpoint = {key: value.detach().cpu().clone()
+                  for key, value in model_a.state_dict().items()}
+    del model_a
+    torch.cuda.empty_cache()
+
+    model_b = build_model(prescf_cfg.model,
+                          train_cfg=prescf_cfg.get('train_cfg'),
+                          test_cfg=prescf_cfg.get('test_cfg')).to(device).eval()
+    load_result = model_b.load_state_dict(checkpoint, strict=True)
+    assert not load_result.missing_keys and not load_result.unexpected_keys
+    model_b.pts_bbox_head.ind_stamps_all = stamps
+    outs_b = {key: [value.clone() for value in values]
+              if isinstance(values, list) else values.clone()
+              for key, values in outs.items()}
+    with torch.no_grad():
+        output_b = model_b._forward_baseline_scf(
+            outs_b, ego_feat.clone(), [{}], {})
+    assert torch.allclose(output_b['cls_score'].cpu(), expected['cls_score'],
+                          atol=1e-6, rtol=1e-6)
+    assert torch.allclose(output_b['refine_pts'].cpu(), expected['refine_pts'],
+                          atol=1e-6, rtol=1e-6)
+    for actual, reference in zip(output_b['forecast_points_list'],
+                                 expected['forecast_points']):
+        assert torch.allclose(actual.cpu(), reference, atol=1e-6, rtol=1e-6)
+    for actual, reference in zip(output_b['forecast_semantics_list'],
+                                 expected['forecast_semantics']):
+        assert torch.allclose(actual.cpu(), reference, atol=1e-6, rtol=1e-6)
+    for actual, reference in zip(output_b['pred_trajs_list'],
+                                 expected['pred_trajs']):
+        assert torch.allclose(actual.cpu(), reference, atol=1e-6, rtol=1e-6)
 
 
 def test_prescf_source_is_recursive_and_has_no_residual_anchor():
@@ -104,6 +200,34 @@ def test_query_motion_changes_final_geometry():
                  identity, identity, warp)
     assert out['query_motion'].abs().sum() > 0
     assert decode_points(out['points'], pc_range).abs().sum() > 0
+
+
+def test_dynamic_evolution_uses_prewarp_pool_and_preserves_xyz_delta():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.bbox.utils import decode_points, encode_points
+    from mmdet3d.models.sparsedetectors.dsqe_dual_evolution import DSQEDualEvolution
+    from mmdet3d.models.sparsedetectors.dsqe_ego_warp import DSQEEgoWarp
+
+    pc_range = torch.tensor([-10., -10., -2., 10., 10., 2.])
+    module = DSQEDualEvolution(4, 2, pc_range, motion_scale=1.)
+    warp = DSQEEgoWarp(pc_range)
+    points_metric = torch.tensor([[[[2., 0., 1.], [4., 0., 3.]]]])
+    points = encode_points(points_metric, pc_range)
+    # Make the point-level dynamic head emit a vertical correction.  The
+    # default path must preserve xyz; only explicit planar_motion_only may
+    # zero z.
+    with torch.no_grad():
+        module.dynamic_head[-1].bias.fill_(0.)
+        module.dynamic_head[-1].bias[2::3].fill_(0.5)
+    next_to_current = torch.eye(4).unsqueeze(0)
+    next_to_current[:, 0, 3] = 1.
+    out = module(torch.zeros(1, 1, 4), points, points[:, :0],
+                 torch.zeros(1, 1, 4), torch.ones(1, 1, 1),
+                 next_to_current, next_to_current, warp)
+    evolved = decode_points(out['dynamic_points_metric'], pc_range)
+    # ego warp maps current points to x-1 in the next frame; the learned
+    # z correction remains visible and is not forcibly clamped to zero.
+    assert torch.all(evolved[..., 2] > 1.)
 
 
 def test_cumulative_pose_targets_are_converted_to_adjacent_transforms():
@@ -201,8 +325,10 @@ def test_role_loss_is_class_balanced_focal_and_reports_f1():
     loss.backward()
     assert torch.isfinite(loss) and logits.grad.abs().sum() > 0
     metrics = OPUSHead._role_metrics(output, cache)
-    assert set(metrics) == {
-        'role_precision', 'role_recall', 'role_f1', 'dynamic_valid_ratio'}
+    assert {
+        'role_precision', 'role_recall', 'role_f1', 'query_precision',
+        'query_recall', 'query_f1', 'dynamic_valid_ratio', 'ignored_ratio',
+        'unmatched_ratio'} <= set(metrics)
     assert metrics['dynamic_valid_ratio'] == 0.25
 
 
@@ -531,6 +657,99 @@ def test_joint_refine_spatial_attention_runs_over_shared_queries():
     assert output['point_correction'].shape == (1, 3, 4, 3)
 
 
+def test_absolute_semantic_head_warm_start_is_function_equivalent():
+    torch = pytest.importorskip('torch')
+    from torch import nn
+    from mmdet3d.models.sparsedetectors.dsqe_joint_refine import DSQEJointRefine
+
+    torch.manual_seed(7)
+    baseline = nn.Sequential(
+        nn.Linear(8, 8), nn.ReLU(), nn.Linear(8, 8), nn.ReLU(),
+        nn.Linear(8, 4 * 3))
+    prescf = DSQEJointRefine(8, 4, num_classes=3, num_heads=1)
+    with torch.no_grad():
+        for index in (0, 2, 4):
+            prescf.semantic_head[index].load_state_dict(
+                baseline[index].state_dict())
+        prescf.point_adapter_gate.fill_(1.)
+    feature = torch.randn(2, 3, 8)
+    points = torch.randn(2, 3, 4, 3)
+    expected = baseline(feature).reshape(2, 3, 4, 3)
+    actual = prescf.predict_semantics(
+        feature, points, use_point_adapter=False)
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_absolute_semantic_head_point_adapter_is_coordinate_sensitive():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.dsqe_joint_refine import DSQEJointRefine
+
+    module = DSQEJointRefine(8, 4, num_classes=3, num_heads=1)
+    with torch.no_grad():
+        module.point_adapter_gate.fill_(1.)
+        module.point_adapter[-1].weight.fill_(1.)
+        module.point_adapter[-1].bias.zero_()
+    feature = torch.zeros(1, 1, 8)
+    points_a = torch.zeros(1, 1, 4, 3)
+    points_b = points_a.clone()
+    points_b[..., 0] = 1.
+    logits_a = module.predict_semantics(feature, points_a)
+    logits_b = module.predict_semantics(feature, points_b)
+    assert not torch.allclose(logits_a, logits_b)
+
+
+def test_role_knn_has_distance_rejection_and_reports_both_directions():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    distances, indices = OPUSHead._chunked_nearest(
+        torch.tensor([[0., 0., 0.], [10., 0., 0.]]),
+        torch.tensor([[0., 0., 0.]]))
+    assert indices.tolist() == [0, 0]
+    assert distances.tolist() == [0., 10.]
+    # A 2.5m matching radius keeps the nearby target and ignores the far one.
+    valid = distances <= 2.5
+    assert valid.tolist() == [True, False]
+
+
+def test_future_role_cache_uses_prediction_to_gt_distance_direction():
+    """Each predicted point must be filtered by its own nearest-GT distance.
+
+    ``_get_target_single`` returns ``pred_index`` as GT indices (one value per
+    predicted point).  Re-indexing the *distance* tensor with those values
+    would accidentally reuse the first prediction's distance whenever several
+    predictions share a GT voxel.
+    """
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.bbox.utils import encode_points
+    from mmdet3d.models.sparsedetectors.opus_head import OPUSHead
+
+    predicted_metric = torch.tensor([[[0., 0., 0.], [10., 0., 0.]]])
+    refine_pts = encode_points(predicted_metric, torch.tensor(
+        [-20., -20., -2., 20., 20., 2.])).reshape(1, 1, 2, 3)
+    gt_points = torch.tensor([[0., 0., 0.], [100., 0., 0.]])
+    gt_labels = torch.tensor([4, 4])
+    motion = dict(
+        centers=torch.tensor([[0., 0., 0.]]),
+        radius=torch.tensor([2.]), role=torch.tensor([1.]),
+        valid=torch.tensor([True]),
+        dims=torch.tensor([[4., 4., 2.]]), yaw=torch.tensor([0.]))
+    fake = SimpleNamespace(
+        pc_range=torch.tensor([-20., -20., -2., 20., 20., 2.]),
+        num_classes=17,
+        dsqe_cfg=dict(role_match_max_distance=2.5),
+        get_sparse_voxels=lambda _voxel: ([gt_points], [gt_labels]),
+        _assign_motion_state_roles=OPUSHead._assign_motion_state_roles,
+        _chunked_nearest=OPUSHead._chunked_nearest,
+        _get_target_single=lambda _pred, _gt, _labels: (
+            torch.tensor([4, 4]), torch.tensor([], dtype=torch.long),
+            torch.tensor([0, 0]), torch.ones(2, 17), torch.ones(0)))
+    cache = OPUSHead.build_future_match_cache(
+        fake, refine_pts, torch.empty(1), role_metadata=[motion])
+    assert cache['role_target'].shape == (1, 1, 2)
+    assert cache['role_valid'].tolist() == [[[True, False]]]
+
+
 def test_dual_interaction_loads_legacy_gate_checkpoint():
     torch = pytest.importorskip('torch')
     from mmdet3d.models.sparsedetectors.dsqe_dual_interaction import DSQEDualInteraction
@@ -568,13 +787,29 @@ def test_interaction_and_joint_stage_gates_ramp_from_identity():
         training=True, curr_epoch=0, prescf_stage1_end_epoch=5,
         prescf_stage2_end_epoch=16, prescf_interaction_ramp_epochs=4,
         prescf_joint_ramp_epochs=4)
-    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (0., 0.)
+    first = SparseWorld4DTraj._prescf_stage_gates(fake)
+    assert first[0] > 0 and first[1] > 0
     fake.curr_epoch = 5
-    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (0.25, 0.)
+    assert SparseWorld4DTraj._prescf_stage_gates(fake)[0] > first[0]
     fake.curr_epoch = 16
-    assert SparseWorld4DTraj._prescf_stage_gates(fake) == (1., 0.25)
+    assert SparseWorld4DTraj._prescf_stage_gates(fake)[0] == 1.
+    assert SparseWorld4DTraj._prescf_stage_gates(fake)[1] > first[1]
     fake.training = False
     assert SparseWorld4DTraj._prescf_stage_gates(fake) == (1., 1.)
+
+
+def test_stage1_gate_and_curriculum_contract_are_nonzero_and_explicit():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    fake = SimpleNamespace(
+        training=True, curr_epoch=0, dsqe_mode='prescf', num_fu_frames=6,
+        dsqe_cfg=dict(stage1_end_epoch=5, stage2_end_epoch=16),
+        prescf_stage1_end_epoch=5, prescf_stage2_end_epoch=16,
+        prescf_forecast_curriculum=(1, 2, 3, 6))
+    for epoch, expected in ((0, 1), (5, 2), (9, 3), (13, 6)):
+        fake.curr_epoch = epoch
+        assert SparseWorld4DTraj._num_forecast_frames(fake) == expected
 
 
 def test_six_step_prescf_rollout_recurses_and_backpropagates():
@@ -590,20 +825,23 @@ def test_six_step_prescf_rollout_recurses_and_backpropagates():
     model = build_model(cfg.model, train_cfg=cfg.get('train_cfg'),
                         test_cfg=cfg.get('test_cfg')).cuda().eval()
     # A BaseLine checkpoint has no absolute PreSCF semantic head.  Loading
-    # its point-specific classifier must warm-start the new head.
-    source_weight = torch.randn_like(model.cls_branch[-1].weight.cpu()) * 0.01
-    source_bias = torch.randn_like(model.cls_branch[-1].bias.cpu()) * 0.01
-    model.load_state_dict({
-        'cls_branch.4.weight': source_weight,
-        'cls_branch.4.bias': source_bias,
-    }, strict=False)
-    expected_weight = source_weight.reshape(
-        -1, 17, source_weight.shape[-1]).mean(0).cuda()
-    expected_bias = source_bias.reshape(-1, 17).mean(0).cuda()
-    assert torch.allclose(model.joint_refine.semantic_head.weight,
-                          expected_weight)
-    assert torch.allclose(model.joint_refine.semantic_head.bias,
-                          expected_bias)
+    # its complete point-specific MLP must warm-start every corresponding
+    # layer, without averaging the final 48x17 projection.
+    warm_state = {}
+    for index in (0, 2, 4):
+        warm_state['cls_branch.{}.weight'.format(index)] = \
+            torch.randn_like(model.cls_branch[index].weight.cpu()) * 0.01
+        warm_state['cls_branch.{}.bias'.format(index)] = \
+            torch.randn_like(model.cls_branch[index].bias.cpu()) * 0.01
+    model.load_state_dict(warm_state, strict=False)
+    for index in (0, 2, 4):
+        assert torch.allclose(
+            getattr(model.joint_refine.semantic_head[index], 'weight'),
+            warm_state['cls_branch.{}.weight'.format(index)].cuda())
+        assert torch.allclose(
+            getattr(model.joint_refine.semantic_head[index], 'bias'),
+            warm_state['cls_branch.{}.bias'.format(index)].cuda())
+    assert model.joint_refine.point_adapter_gate.item() == 1.
     for module in (model.img_backbone, model.img_neck,
                    model.plan_head, model.ego_cross_attn, model.traj_head):
         assert not any(parameter.requires_grad for parameter in module.parameters())

@@ -10,7 +10,8 @@ class DSQEDualEvolution(nn.Module):
     def __init__(self, embed_dims, num_points, pc_range, motion_scale=4.0,
                  static_alpha=0.1, residual_scale=1.0, new_residual_scale=1.0,
                  beta=None, static_alpha_max=None,
-                 dynamic_residual_scale=None, **kwargs):
+                 dynamic_residual_scale=None, planar_motion_only=False,
+                 **kwargs):
         super().__init__()
         self.num_points = num_points
         self.motion_scale = motion_scale
@@ -18,6 +19,7 @@ class DSQEDualEvolution(nn.Module):
         self.residual_scale = (residual_scale if dynamic_residual_scale is None
                                else dynamic_residual_scale)
         self.new_residual_scale = new_residual_scale
+        self.planar_motion_only = bool(planar_motion_only)
         self.register_buffer('pc_range', torch.as_tensor(pc_range).float())
         self.motion_head = nn.Sequential(
             nn.Linear(embed_dims * 2 + 4, embed_dims), nn.ReLU(inplace=True),
@@ -50,18 +52,25 @@ class DSQEDualEvolution(nn.Module):
                 query_role, next_to_current, next_to_t0, ego_warp):
         nc = carried_points.shape[1]
         carried_feat, new_feat = query_feat[:, :nc], query_feat[:, nc:]
+        # Motion is estimated from the current state P_t, before applying the
+        # ego warp.  The warped points are only the geometric prior for the
+        # next state; using their mean here would leak the frame transform
+        # into the actor-motion head and double-count ego motion.
+        carried_current_metric = decode_points(carried_points, self.pc_range)
         carried_prior = ego_warp.current_to_next(carried_points, next_to_current)
         new_prior = ego_warp.t0_to_next(new_points_t0, next_to_t0)
         carried_metric = decode_points(carried_prior, self.pc_range)
         new_metric = decode_points(new_prior, self.pc_range)
         if nc:
-            center = carried_metric.mean(2)
+            center = carried_current_metric.mean(2)
             ego = ego_feat.expand(-1, nc, -1)
             motion = self.motion_head(torch.cat([
                 carried_feat, ego, center, query_role[:, :nc]], -1)).tanh() * self.motion_scale
             static_delta = self._residual(self.static_head, carried_feat, self.residual_scale)
             dynamic_delta = self._residual(self.dynamic_residual_head, carried_feat, self.residual_scale)
-            dynamic_delta = dynamic_delta.clone(); dynamic_delta[..., 2] = 0
+            if self.planar_motion_only:
+                dynamic_delta = dynamic_delta.clone()
+                dynamic_delta[..., 2] = 0
             static_points = carried_metric + self.static_alpha * static_delta
             dynamic_points = carried_metric + motion.unsqueeze(2) + dynamic_delta
             # One Query owns all of its refine points.  Use the pooled Query

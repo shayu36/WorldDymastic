@@ -193,7 +193,8 @@ class SparseWorld4DTraj(OPUS):
             motion_scale=cfg.get('motion_scale', 4.0),
             static_alpha=cfg.get('static_alpha', 0.1),
             residual_scale=cfg.get('point_residual_scale', 1.0),
-            new_residual_scale=cfg.get('new_residual_scale', 1.0))
+            new_residual_scale=cfg.get('new_residual_scale', 1.0),
+            planar_motion_only=cfg.get('planar_motion_only', False))
         self.dual_interaction = DSQEDualInteraction(
             self.out_dim, num_heads=cfg.get('num_heads', 8),
             local_k=cfg.get('local_k', 16),
@@ -207,6 +208,10 @@ class SparseWorld4DTraj(OPUS):
         self.source_embedding = nn.Embedding(2, self.out_dim)
         self.activation_embedding = nn.Embedding(
             self.num_fu_frames + 1, self.out_dim)
+        # These embeddings annotate the state provenance/time slot but must
+        # not perturb a loaded BaseLine representation at initialization.
+        nn.init.zeros_(self.source_embedding.weight)
+        nn.init.zeros_(self.activation_embedding.weight)
         self.prescf_ego_pose_head = nn.Sequential(
             nn.Linear(self.out_dim, self.out_dim), nn.ReLU(inplace=True),
             nn.Linear(self.out_dim, 4))
@@ -244,6 +249,15 @@ class SparseWorld4DTraj(OPUS):
             cfg.get('interaction_ramp_epochs', 4)), 1)
         self.prescf_joint_ramp_epochs = max(int(
             cfg.get('joint_ramp_epochs', 4)), 1)
+        self.prescf_stage_gate_floor = float(cfg.get(
+            'stage_gate_floor', 0.1))
+        if not 0.0 < self.prescf_stage_gate_floor <= 1.0:
+            raise ValueError('stage_gate_floor must be in (0, 1]')
+        curriculum = cfg.get('forecast_curriculum', [1, 2, 3, 6])
+        if not isinstance(curriculum, (list, tuple)) or not curriculum:
+            raise TypeError('forecast_curriculum must be a non-empty sequence')
+        self.prescf_forecast_curriculum = tuple(
+            max(1, min(int(step), self.num_fu_frames)) for step in curriculum)
         self.prescf_stage = 1
         self.prescf_enable_interaction = False
         self.prescf_enable_joint_refine = False
@@ -357,8 +371,11 @@ class SparseWorld4DTraj(OPUS):
         else:
             stage = 3
         self.prescf_stage = stage
-        self.prescf_enable_interaction = stage >= 2
-        self.prescf_enable_joint_refine = stage >= 3
+        # All PreSCF blocks are part of the Stage-1 graph.  Curriculum is
+        # expressed by their smooth positive gates below, never by bypassing
+        # a module (which would produce unused parameters under DDP).
+        self.prescf_enable_interaction = True
+        self.prescf_enable_joint_refine = True
 
     def _prescf_stage_gates(self):
         """Return smooth module gates while retaining a complete DDP graph."""
@@ -370,28 +387,32 @@ class SparseWorld4DTraj(OPUS):
         joint = min(max(
             (self.curr_epoch - self.prescf_stage2_end_epoch + 1) /
             self.prescf_joint_ramp_epochs, 0.0), 1.0)
-        return interaction, joint
+        # Stage 1 still trains interaction and joint refinement.  A small
+        # positive blend keeps the branch numerically close to its BaseLine
+        # anchor while ensuring every expected module receives gradients.
+        floor = self.prescf_stage_gate_floor if hasattr(
+            self, 'prescf_stage_gate_floor') else 0.1
+        return floor + (1.0 - floor) * interaction, floor + (1.0 - floor) * joint
 
     def init_weights(self):
         self.pts_bbox_head.init_weights()
         bias_init = bias_init_with_prob(0.01)
         nn.init.constant_(self.cls_branch[-1].bias, bias_init)
         # Warm-start the absolute PreSCF semantic head from the trained
-        # BaseLine classifier.  The BaseLine classifier emits one 17-way
-        # vector per refine point; averaging those point-specific projections
-        # gives the new point-conditioned head a sensible initial prior.
+        # BaseLine classifier.  Copy every layer of the classifier MLP; the
+        # final projection retains an independent 17-way vector for each
+        # refine point, so no point-specific weights are averaged.
         if self.dsqe_mode == 'prescf' and hasattr(self, 'joint_refine'):
-            source = self.cls_branch[-1]
             target = self.joint_refine.semantic_head
             with torch.no_grad():
-                if source.weight.shape[0] % target.out_features == 0 and \
-                        source.weight.shape[1] == target.in_features:
-                    weights = source.weight.reshape(
-                        -1, target.out_features, target.in_features).mean(0)
-                    bias = source.bias.reshape(
-                        -1, target.out_features).mean(0)
-                    target.weight.copy_(weights)
-                    target.bias.copy_(bias)
+                for index in (0, 2, 4):
+                    source = self.cls_branch[index]
+                    destination = target[index]
+                    if (isinstance(source, nn.Linear) and
+                            isinstance(destination, nn.Linear) and
+                            source.weight.shape == destination.weight.shape):
+                        destination.weight.copy_(source.weight)
+                        destination.bias.copy_(source.bias)
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata,
                               strict, missing_keys, unexpected_keys,
@@ -405,22 +426,24 @@ class SparseWorld4DTraj(OPUS):
         leaving native PreSCF checkpoints untouched.
         """
         if self.dsqe_mode == 'prescf' and hasattr(self, 'joint_refine'):
-            target_weight = prefix + 'joint_refine.semantic_head.weight'
-            target_bias = prefix + 'joint_refine.semantic_head.bias'
-            source_index = len(self.cls_branch) - 1
-            source_weight = prefix + 'cls_branch.{}.weight'.format(source_index)
-            source_bias = prefix + 'cls_branch.{}.bias'.format(source_index)
-            if target_weight not in state_dict and source_weight in state_dict:
-                weight = state_dict[source_weight]
-                classes = self.joint_refine.semantic_head.out_features
-                if weight.shape[0] % classes == 0:
-                    state_dict[target_weight] = weight.reshape(
-                        -1, classes, weight.shape[-1]).mean(0)
-            if target_bias not in state_dict and source_bias in state_dict:
-                bias = state_dict[source_bias]
-                classes = self.joint_refine.semantic_head.out_features
-                if bias.shape[0] % classes == 0:
-                    state_dict[target_bias] = bias.reshape(-1, classes).mean(0)
+            target = self.joint_refine.semantic_head
+            # A BaseLine checkpoint has ``cls_branch.{0,2,4}``; inject the
+            # corresponding full MLP tensors only when a native PreSCF head
+            # is absent.  This preserves strict loading for native PreSCF
+            # checkpoints and makes the warm-start function-equivalent.
+            for index in (0, 2, 4):
+                source_weight = prefix + 'cls_branch.{}.weight'.format(index)
+                source_bias = prefix + 'cls_branch.{}.bias'.format(index)
+                target_weight = prefix + 'joint_refine.semantic_head.{}.weight'.format(index)
+                target_bias = prefix + 'joint_refine.semantic_head.{}.bias'.format(index)
+                if target_weight not in state_dict and source_weight in state_dict:
+                    source = state_dict[source_weight]
+                    if source.shape == target[index].weight.shape:
+                        state_dict[target_weight] = source.clone()
+                if target_bias not in state_dict and source_bias in state_dict:
+                    source = state_dict[source_bias]
+                    if source.shape == target[index].bias.shape:
+                        state_dict[target_bias] = source.clone()
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys,
             unexpected_keys, error_msgs)
@@ -510,16 +533,28 @@ class SparseWorld4DTraj(OPUS):
             configured = self.dsqe_cfg.get('forecast_steps')
             if configured is not None:
                 return max(1, min(int(configured), self.num_fu_frames))
-            # Keep Stage 1 genuinely one-step.  Once the role/pose heads have
-            # a stable target, ramp the closed-loop horizon 2,3,...,6 and
-            # retain the full horizon for Stage 3.
+            # Keep Stage 1 genuinely one-step.  Stage 2 follows the explicit
+            # 1 -> 2 -> 3 -> 6 curriculum before retaining six steps in
+            # Stage 3.
             stage1_end = int(self.dsqe_cfg.get(
                 'stage1_end_epoch', getattr(self, 'prescf_stage1_end_epoch', 5)))
             if self.curr_epoch < stage1_end:
-                return max(1, min(int(self.dsqe_cfg.get(
-                    'stage1_forecast_steps', 1)), self.num_fu_frames))
-            ramp = self.curr_epoch - stage1_end + 2
-            return max(1, min(ramp, self.num_fu_frames))
+                return self.prescf_forecast_curriculum[0] if hasattr(
+                    self, 'prescf_forecast_curriculum') else 1
+            curriculum = getattr(self, 'prescf_forecast_curriculum',
+                                 (1, 2, 3, 6))
+            if len(curriculum) == 1:
+                return curriculum[0]
+            stage2_end = int(self.dsqe_cfg.get(
+                'stage2_end_epoch', getattr(self, 'prescf_stage2_end_epoch',
+                                            stage1_end + 1)))
+            span = max(stage2_end - stage1_end, 1)
+            progress = self.curr_epoch - stage1_end
+            # Split Stage 2 into equal, deterministic bins.  The last bin
+            # reaches the full configured horizon before Stage 3 begins.
+            bin_index = min((progress * (len(curriculum) - 1)) // span,
+                            len(curriculum) - 2)
+            return curriculum[bin_index + 1]
         return max(1, min(self.curr_epoch - self.finetune_epoch + 1,
                           self.num_fu_frames))
 
