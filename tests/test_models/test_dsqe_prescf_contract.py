@@ -134,11 +134,15 @@ def test_prescf_foreground_mask_does_not_reapply_baseline_trajectory_warp():
 
     # Call the unbound helper so the test does not need to construct the full
     # detector.  A poisoned kwargs object proves the method is frame-local.
-    points = torch.tensor([[[[0.2, 0.5, 0.5], [-0.1, 0.5, 0.5]]]])
+    points = torch.tensor([[[
+        [0.2, 0.5, 0.5], [-0.1, 0.5, 0.5], [1.0, 0.5, 0.5],
+        [0.2, -0.1, 0.5], [0.2, 1.0, 0.5],
+        [0.2, 0.5, -0.1], [0.2, 0.5, 1.0]]]])
     mask = SparseWorld4DTraj._prescf_foreground_mask(
         object(), points, interval=3, img_metas=None,
         kwargs={'temporal_trajs': object(), 'ego2lidar': object()})
-    assert torch.equal(mask, torch.tensor([[[True, False]]]))
+    assert torch.equal(mask, torch.tensor([[[
+        True, False, False, False, False, False, False]]]))
 
 
 def test_prescf_training_pipeline_carries_ragged_actor_supervision():
@@ -957,6 +961,48 @@ def test_new_query_actor_association_is_initialized_independently():
         [carried['point_actor_id'], new['point_actor_id']], dim=1)
     assert combined.tolist() == [[[0, 0], [1, 1]]]
     assert SparseWorld4DTraj._query_actor_ids(combined).tolist() == [[0, 1]]
+
+
+def test_new_query_actor_association_waits_for_future_horizon():
+    torch = pytest.importorskip('torch')
+    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
+
+    current_metadata = [dict(
+        centers=torch.tensor([[0., 0., 0.], [10., 0., 0.]]),
+        radius=torch.tensor([2., 2.]), role=torch.ones(2),
+        valid=torch.ones(2, dtype=torch.bool),
+        dims=torch.tensor([[3., 3., 2.], [3., 3., 2.]]),
+        yaw=torch.zeros(2), inflation=0.)]
+    future_metadata = [dict(
+        # Actor row 0 moves to x=10 at t+1; row 1 moves away.  Premature
+        # matching at t would bind this proposal to the wrong row 1.
+        centers=torch.tensor([[10., 0., 0.], [20., 0., 0.]]),
+        radius=torch.tensor([2., 2.]), role=torch.ones(2),
+        valid=torch.ones(2, dtype=torch.bool),
+        dims=torch.tensor([[3., 3., 2.], [3., 3., 2.]]),
+        yaw=torch.zeros(2), inflation=0.)]
+    new_points = torch.tensor([[[[10., 0., 0.], [10.5, 0., 0.]]]])
+
+    # stamp=t+1 starts unassociated and is excluded from the current cache,
+    # even though its proposal overlaps actor row 1 at time t.
+    point_actor_id = torch.full((1, 1, 2), -1, dtype=torch.long)
+    current_cache = dict(
+        role_target=torch.ones(1, 1, 2),
+        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
+    current_cache = SparseWorld4DTraj._mask_new_query_role_cache(
+        current_cache, num_carried=0)
+    assert point_actor_id.eq(-1).all()
+    assert not current_cache['role_valid'].any()
+
+    recovered = SparseWorld4DTraj._recover_actor_association(
+        point_actor_id, new_points, future_metadata, max_distance=2.5)
+    assert recovered['point_actor_id'].tolist() == [[[0, 0]]]
+    assert recovered['query_actor_id'].tolist() == [[0]]
+
+    # Demonstrate why the current-horizon match is forbidden.
+    premature = SparseWorld4DTraj._initialize_actor_association(
+        new_points, current_metadata)
+    assert premature['point_actor_id'].tolist() == [[[1, 1]]]
 
 
 def test_actor_invalidity_masks_future_role_supervision():

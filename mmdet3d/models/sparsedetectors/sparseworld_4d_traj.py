@@ -1107,6 +1107,20 @@ class SparseWorld4DTraj(OPUS):
                 state.get('future_match_cache'))
 
     @staticmethod
+    def _mask_new_query_role_cache(cache, num_carried):
+        """Exclude stamp ``t+1`` Queries from the current-time role GT."""
+        if cache is None or cache.get('role_target') is None:
+            return cache
+        cache = dict(cache)
+        target = cache['role_target'].clone()
+        valid = cache['role_valid'].clone()
+        if num_carried < target.shape[1]:
+            target[:, num_carried:] = 0
+            valid[:, num_carried:] = False
+        cache.update(role_target=target, role_valid=valid)
+        return cache
+
+    @staticmethod
     def _prescf_role_supervision_outputs(state):
         """Expose pure current predictions and next-state roles separately."""
         prediction = dict(
@@ -1148,11 +1162,10 @@ class SparseWorld4DTraj(OPUS):
         points, however, have already been warped into ``E_{t+1}`` by the
         recursive state transition.  Applying that conversion a second time
         would mix frames and make the occupancy supervision mask depend on
-        the old residual-path convention.  The encoded point range test is
-        the same fallback used by BaseLine when no trajectory metadata is
-        available, while remaining frame-consistent for every future step.
+        the old residual-path convention.  The complete encoded xyz range is
+        checked in this already-aligned frame for every future step.
         """
-        return points[..., 0] >= 0
+        return ((points >= 0) & (points < 1)).all(dim=-1)
 
     @staticmethod
     def _matrix_value(value, device, dtype, batch_size):
@@ -1393,22 +1406,23 @@ class SparseWorld4DTraj(OPUS):
             state_semantics = torch.cat([state_semantics, new_semantics], dim=1)
             current_metadata = (role_metadata_at(interval)
                                 if self.training else None)
-            # Establish actor identity exactly once when a Query enters the
-            # recurrent state.  Carried IDs are never recomputed from drifted
-            # predictions; only the newly activated slice is independently
-            # matched at its own current horizon.
+            # Only carried Queries belong to the current state ``t``.  A
+            # stamp ``t+1`` RAP Query enters with actor ID -1 and receives its
+            # first association only after the transition has produced
+            # P_(t+1), using future metadata.  Existing carried IDs remain
+            # immutable across prediction drift.
             if state_point_actor_id is None:
                 association = self._initialize_actor_association(
-                    decode_points(state_points, self.pc_range),
+                    decode_points(
+                        state_points[:, :num_carried], self.pc_range),
                     current_metadata)
                 state_point_actor_id = association['point_actor_id']
-            elif num_new:
-                new_association = self._initialize_actor_association(
-                    decode_points(new_points_current, self.pc_range),
-                    current_metadata)
+            if num_new:
+                unassociated_new = torch.full(
+                    (batch_size, num_new, self.num_refines), -1,
+                    device=state_points.device, dtype=torch.long)
                 state_point_actor_id = torch.cat([
-                    state_point_actor_id,
-                    new_association['point_actor_id']], dim=1)
+                    state_point_actor_id, unassociated_new], dim=1)
             current_actor_valid = self._refresh_actor_association(
                 state_point_actor_id, current_metadata)
             current_query_actor_id = self._query_actor_ids(
@@ -1472,12 +1486,17 @@ class SparseWorld4DTraj(OPUS):
                         role_cache, state_point_actor_id, metadata)
                     role_target = role_cache['role_target'].unsqueeze(-1)
                     role_target_valid = role_cache['role_valid'].unsqueeze(-1)
+                role_cache = self._mask_new_query_role_cache(
+                    role_cache, num_carried)
+                if role_cache is not None:
+                    role_target = role_cache['role_target'].unsqueeze(-1)
+                    role_target_valid = role_cache['role_valid'].unsqueeze(-1)
                 if role_cache is not None and self.prescf_role_teacher_forcing > 0:
                     teacher_role = role_target
                     teacher_valid = role_target_valid.clone()
-                    # New Queries use their own activation-time association.
-                    # ``role_prior_valid`` remains false for that slice, so no
-                    # carried role can leak into this GT teacher route.
+                    # New Queries are invalid in the current cache and hence
+                    # never receive GT_t teacher routing.  Their next role is
+                    # supervised after P_(t+1) is available.
             role = self.role_router(
                 conditioned_feat, state_points, state_semantics, source,
                 role_prior=role_prior, role_prior_valid=role_prior_valid,
