@@ -397,6 +397,76 @@ class OPUSHead(BaseModule):
 
         return loss_cls, loss_pts
 
+    def loss_single_rangemask_cached(self, cls_scores, refine_pts,
+                                      points_mask, match_cache):
+        """Compute future occupancy loss from an already-built match cache.
+
+        ``SparseWorld4DTraj._forward_prescf`` builds the future cache from the
+        exact encoded point tensor that is passed back here.  The original
+        implementation performed another ``get_sparse_voxels`` and CUDA KNN
+        pass in ``loss_future`` even though the cache already contained all
+        target indices and weights.  Reusing those non-differentiable indices
+        is numerically equivalent to ``loss_single_rangemask`` while keeping
+        the decoded prediction tensors in the loss graph, so point/evolution
+        gradients are unchanged.
+
+        This helper intentionally has no fallback logic; callers must verify
+        that the cache is complete and use the legacy path otherwise.
+        """
+        batch_size = cls_scores.size(0)
+        cls_scores = cls_scores.reshape(batch_size, -1, self.num_classes)
+        pred_pts = decode_points(
+            refine_pts.reshape(batch_size, -1, 3), self.pc_range)
+
+        labels_list = match_cache['labels_list']
+        gt_paired_idx_list = match_cache['gt_paired_idx_list']
+        pred_paired_idx_list = match_cache['pred_paired_idx_list']
+        cls_weight_list = match_cache['label_weights_list']
+        gt_pts_weight_list = match_cache['gt_pts_weights_list']
+        gt_points_list = match_cache['gt_points_list']
+
+        if len(labels_list) != batch_size:
+            raise ValueError('future match cache batch size mismatch')
+
+        gt_paired_pts, pred_paired_pts = [], []
+        pred_points_list = [pred_pts[i] for i in range(batch_size)]
+        for i in range(batch_size):
+            gt_paired_pts.append(
+                pred_points_list[i][gt_paired_idx_list[i]])
+            pred_paired_pts.append(
+                gt_points_list[i][pred_paired_idx_list[i]])
+
+        flat_cls_scores = torch.cat(
+            [cls_scores[i] for i in range(batch_size)])
+        labels = torch.cat(labels_list)
+        cls_weights = torch.cat(cls_weight_list)
+        gt_pts = torch.cat(gt_points_list)
+        gt_paired_pts = torch.cat(gt_paired_pts)
+        gt_pts_weights = torch.cat(gt_pts_weight_list)
+        pred_pts_flat = torch.cat(pred_points_list)
+        pred_paired_pts = torch.cat(pred_paired_pts)
+
+        if points_mask is None:
+            flat_points_mask = flat_cls_scores.new_ones(
+                flat_cls_scores.shape[0])
+        else:
+            flat_points_mask = points_mask.reshape(batch_size, -1).reshape(-1)
+            flat_points_mask = flat_points_mask.to(flat_cls_scores.dtype)
+
+        loss_cls = self.loss_cls(
+            flat_cls_scores, labels,
+            weight=cls_weights * flat_points_mask[:, None],
+            avg_factor=flat_cls_scores.shape[0])
+        loss_pts = pred_pts_flat.new_zeros(())
+        loss_pts = loss_pts + self.loss_pts(
+            gt_pts, gt_paired_pts,
+            weight=gt_pts_weights[..., None], avg_factor=gt_pts.shape[0])
+        loss_pts = loss_pts + self.loss_pts(
+            pred_pts_flat, pred_paired_pts,
+            weight=flat_points_mask[:, None],
+            avg_factor=pred_pts_flat.shape[0])
+        return loss_cls, loss_pts
+
 
 
     @staticmethod
@@ -452,13 +522,19 @@ class OPUSHead(BaseModule):
 
     @staticmethod
     def _chunked_nearest_indices(query_points, reference_points,
-                                 chunk_size=1024):
+                                 chunk_size=4096):
         return OPUSHead._chunked_nearest(
             query_points, reference_points, chunk_size=chunk_size)[1]
 
     @staticmethod
-    def _chunked_nearest(query_points, reference_points, chunk_size=1024):
-        """Return non-differentiable L1 nearest distances and indices."""
+    def _chunked_nearest(query_points, reference_points, chunk_size=4096):
+        """Return non-differentiable L1 nearest distances and indices.
+
+        A 4096-point tile occupies about 64 MiB in fp32, which is modest
+        relative to the model activation footprint but cuts kernel-launch
+        count by up to 16x versus the historical 1024x1024 tiling.  The
+        search order and distance definition remain unchanged.
+        """
         if query_points.shape[0] == 0:
             return (torch.empty(query_points.shape[0], device=query_points.device,
                                 dtype=query_points.dtype),
@@ -528,26 +604,31 @@ class OPUSHead(BaseModule):
             gt_weight_list.append(gt_weight); role_target_list.append(target)
             role_valid_list.append(valid)
         role_targets, role_valids, gt_to_pred_distances = [], [], []
+        gt_to_pred_indices = []
         for b in range(batch_size):
-            pred_index = pred_index_list[b]
-            if pred_index.numel():
-                role_targets.append(role_target_list[b][pred_index].float())
-                # The occupancy matcher is intentionally permissive, but a
-                # role target must not be borrowed from an unrelated distant
-                # voxel.  Reject such pairs and leave them ignored.
-                distances, _ = self._chunked_nearest(
+            if gt_points_list[b].numel():
+                # Role routing consistently uses the L1 matcher in both the
+                # current-state and future-state caches.  Occupancy keeps its
+                # original CUDA/L2 assignment above; the two objectives do
+                # not need to share indices.  Keeping the role matcher
+                # identical also makes the future cache an exact reusable
+                # current cache for the next recursive state.
+                distances, role_index = self._chunked_nearest(
                     decoded[b], gt_points_list[b])
+                role_targets.append(
+                    role_target_list[b][role_index].float())
                 max_distance = float(getattr(self, 'dsqe_cfg', {}).get(
                     'role_match_max_distance', 2.5))
-                role_valids.append(role_valid_list[b][pred_index] &
+                role_valids.append(role_valid_list[b][role_index] &
                                    (distances <= max_distance))
             else:
                 role_targets.append(decoded.new_zeros(decoded.shape[1]))
                 role_valids.append(torch.zeros(decoded.shape[1], device=decoded.device,
                                                dtype=torch.bool))
-            gt_distances, _ = self._chunked_nearest(
+            gt_distances, gt_indices = self._chunked_nearest(
                 gt_points_list[b], decoded[b])
             gt_to_pred_distances.append(gt_distances)
+            gt_to_pred_indices.append(gt_indices)
         role_match_max_distance = float(getattr(self, 'dsqe_cfg', {}).get(
             'role_match_max_distance', 2.5))
         return dict(labels_list=labels_list, gt_paired_idx_list=gt_index_list,
@@ -559,6 +640,7 @@ class OPUSHead(BaseModule):
                     gt_role_target_list=role_target_list,
                     gt_role_valid_list=role_valid_list,
                     gt_to_pred_distance_list=gt_to_pred_distances,
+                    gt_to_pred_index_list=gt_to_pred_indices,
                     role_match_max_distance=role_match_max_distance,
                     role_target=torch.stack(role_targets).reshape(
                         batch_size, num_query, num_points),
@@ -583,6 +665,7 @@ class OPUSHead(BaseModule):
             'dynamic_class_ids', [2, 3, 4, 5, 6, 7, 9, 10])
         targets, valids, gt_targets, gt_valids = [], [], [], []
         gt_to_pred_distances = []
+        gt_to_pred_indices = []
         for b, (gt_points, gt_labels) in enumerate(zip(gt_points_list,
                                                        gt_labels_list)):
             motion = None if role_metadata is None or b >= len(role_metadata) \
@@ -602,8 +685,10 @@ class OPUSHead(BaseModule):
                 valids.append(torch.zeros(decoded.shape[1],
                                           device=decoded.device,
                                           dtype=torch.bool))
-            gt_distances, _ = self._chunked_nearest(gt_points, decoded[b])
+            gt_distances, gt_indices = self._chunked_nearest(
+                gt_points, decoded[b])
             gt_to_pred_distances.append(gt_distances)
+            gt_to_pred_indices.append(gt_indices)
         role_match_max_distance = float(getattr(self, 'dsqe_cfg', {}).get(
             'role_match_max_distance', 2.5))
         return dict(role_target=torch.stack(targets).reshape(
@@ -613,6 +698,7 @@ class OPUSHead(BaseModule):
                     gt_role_target_list=gt_targets,
                     gt_role_valid_list=gt_valids,
                     gt_to_pred_distance_list=gt_to_pred_distances,
+                    gt_to_pred_index_list=gt_to_pred_indices,
                     role_match_max_distance=role_match_max_distance)
 
     @staticmethod
@@ -842,8 +928,24 @@ class OPUSHead(BaseModule):
             # ignoring portions of a moving actor's future footprint.  This
             # direction deliberately searches all predictions but only the
             # selected nearest entries receive gradient.
-            gt_distances, gt_to_pred = OPUSHead._chunked_nearest(
-                dynamic_points, pred_points)
+            # ``build_future_match_cache`` already computed the GT -> nearest
+            # prediction map for this exact future point tensor.  Reusing it
+            # avoids another Python/chunked cdist pass while preserving the
+            # selected prediction tensor (and therefore its geometry
+            # gradient).  Keep the old fallback for hand-built/private
+            # caches used by unit tests and legacy callers.
+            cached_distances = cache.get('gt_to_pred_distance_list')
+            cached_indices = cache.get('gt_to_pred_index_list')
+            if (cached_distances is not None and
+                    cached_indices is not None and b < len(cached_distances) and
+                    b < len(cached_indices) and
+                    cached_distances[b].numel() == gt_points.shape[0] and
+                    cached_indices[b].numel() == gt_points.shape[0]):
+                gt_distances = cached_distances[b][dynamic]
+                gt_to_pred = cached_indices[b][dynamic]
+            else:
+                gt_distances, gt_to_pred = OPUSHead._chunked_nearest(
+                    dynamic_points, pred_points)
             gt_error = F.smooth_l1_loss(
                 dynamic_points, pred_points[gt_to_pred], reduction='none',
                 beta=beta).mean(-1)
@@ -1008,22 +1110,41 @@ class OPUSHead(BaseModule):
     def loss_future(self, voxel_semantics, all_refine_pts, all_cls_scores,
                     points_mask, dsqe_outputs=None, match_cache_list=None):
         # voxelsemantics [B, X200, Y200, Z16] unocuupied=17
+        # In PreSCF, ``build_future_match_cache`` has already run the exact
+        # target assignment on each future point tensor.  Reuse those indices
+        # instead of extracting sparse voxels and launching the same KNN a
+        # second time here.  Baseline/legacy callers have no cache and retain
+        # the original path byte-for-byte.
+        cache_complete = (
+            match_cache_list is not None and
+            len(match_cache_list) == len(all_cls_scores) and
+            all(cache is not None and
+                all(key in cache for key in (
+                    'labels_list', 'gt_paired_idx_list',
+                    'pred_paired_idx_list', 'label_weights_list',
+                    'gt_pts_weights_list', 'gt_points_list'))
+                for cache in match_cache_list))
+        if cache_complete:
+            losses_cls, losses_pts = [], []
+            for cls_scores, refine_pts, mask, cache in zip(
+                    all_cls_scores, all_refine_pts, points_mask,
+                    match_cache_list):
+                loss_cls, loss_pts = self.loss_single_rangemask_cached(
+                    cls_scores, refine_pts, mask, cache)
+                losses_cls.append(loss_cls)
+                losses_pts.append(loss_pts)
+        else:
+            gt_points_list, gt_labels_list = [], []
+            for voxel_sem in voxel_semantics:
+                gt_points, gt_labels = self.get_sparse_voxels(voxel_sem)
+                gt_points_list.append(gt_points)
+                gt_labels_list.append(gt_labels)
 
-        gt_points_list, gt_labels_list = [],  []
-        for voxel_sem in voxel_semantics:
-            gt_points,  gt_labels = \
-                self.get_sparse_voxels(voxel_sem)
-            gt_points_list.append(gt_points)
-
-            gt_labels_list.append(gt_labels)
-
-        # all_cls_scores = torch.unbind(all_cls_scores,0)
-        all_gt_points_list = gt_points_list
-        all_gt_labels_list = gt_labels_list
-
-        losses_cls, losses_pts = multi_apply(
-            self.loss_single_rangemask, all_cls_scores, all_refine_pts,points_mask,
-            all_gt_points_list, all_gt_labels_list)
+            all_gt_points_list = gt_points_list
+            all_gt_labels_list = gt_labels_list
+            losses_cls, losses_pts = multi_apply(
+                self.loss_single_rangemask, all_cls_scores, all_refine_pts,
+                points_mask, all_gt_points_list, all_gt_labels_list)
 
         loss_dict = dict()
         # loss of init_points

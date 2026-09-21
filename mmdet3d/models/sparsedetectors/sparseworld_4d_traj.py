@@ -252,6 +252,8 @@ class SparseWorld4DTraj(OPUS):
             'next_role_loss_weight', 1.0))
         if self.prescf_next_role_loss_weight <= 0:
             raise ValueError('next_role_loss_weight must be positive')
+        self.prescf_skip_frozen_baseline_losses = bool(cfg.get(
+            'skip_frozen_baseline_losses', True))
         self.prescf_stage1_end_epoch = int(cfg.get('stage1_end_epoch', 5))
         self.prescf_stage2_end_epoch = int(cfg.get('stage2_end_epoch', 16))
         self.prescf_interaction_ramp_epochs = max(int(
@@ -341,6 +343,28 @@ class SparseWorld4DTraj(OPUS):
         if self._prescf_tass_frozen:
             return torch.zeros_like(gradient)
         return gradient
+
+    @staticmethod
+    def _prescf_tass_ddp_anchor(outs):
+        """Keep staged TASS output branches visible to the DDP reducer.
+
+        Stage 1/2 omit the expensive BaseLine target construction while the
+        TASS anchor is frozen.  Its final decoder layers nevertheless remain
+        in DDP from startup so Stage 3 can unfreeze them without rebuilding
+        the reducer.  Some intermediate classifier/regression branches do not
+        feed the final Query state directly; a zero-valued dependency on all
+        differentiable decoder outputs marks those parameters as used without
+        changing either the loss value or any gradient.
+        """
+        anchor = None
+        for key in ('all_cls_scores', 'all_refine_pts', 'query_feat'):
+            value = outs.get(key)
+            tensors = value if isinstance(value, (list, tuple)) else (value,)
+            for tensor in tensors:
+                if torch.is_tensor(tensor) and tensor.requires_grad:
+                    term = tensor.sum() * 0.0
+                    anchor = term if anchor is None else anchor + term
+        return anchor
 
     def _freeze_prescf_tass_state(self):
         """Capture and restore the non-parameter TASS assignment state.
@@ -1121,6 +1145,54 @@ class SparseWorld4DTraj(OPUS):
         return cache
 
     @staticmethod
+    def _append_unmatched_queries_to_role_cache(cache, num_new):
+        """Extend a carried-state cache with ignored newly activated Queries.
+
+        The future cache produced by transition ``t-1 -> t`` is already an
+        exact match for the carried ``P_t`` state and ``GT_t``.  Reusing it in
+        the next recursion avoids running the same sparse-voxel extraction
+        and bidirectional nearest-neighbour search again.  Stamp ``t+1`` RAP
+        Queries do not belong to ``GT_t``; append zero targets with invalid
+        masks until they receive their own association at ``t+1``.
+        """
+        if cache is None or num_new <= 0:
+            return cache
+        cache = dict(cache)
+        target = cache.get('role_target')
+        valid = cache.get('role_valid')
+        if target is None or valid is None:
+            return cache
+        target_padding = target.new_zeros(
+            target.shape[0], num_new, target.shape[2])
+        valid_padding = torch.zeros(
+            valid.shape[0], num_new, valid.shape[2],
+            device=valid.device, dtype=torch.bool)
+        cache['role_target'] = torch.cat([target, target_padding], dim=1)
+        cache['role_valid'] = torch.cat([valid, valid_padding], dim=1)
+
+        point_actor_id = cache.get('point_actor_id')
+        if point_actor_id is not None:
+            actor_padding = point_actor_id.new_full(
+                (point_actor_id.shape[0], num_new,
+                 point_actor_id.shape[2]), -1)
+            cache['point_actor_id'] = torch.cat(
+                [point_actor_id, actor_padding], dim=1)
+        actor_valid = cache.get('actor_valid')
+        if actor_valid is not None:
+            actor_valid_padding = torch.zeros(
+                actor_valid.shape[0], num_new, actor_valid.shape[2],
+                device=actor_valid.device, dtype=torch.bool)
+            cache['actor_valid'] = torch.cat(
+                [actor_valid, actor_valid_padding], dim=1)
+        query_actor_id = cache.get('query_actor_id')
+        if query_actor_id is not None:
+            query_padding = query_actor_id.new_full(
+                (query_actor_id.shape[0], num_new), -1)
+            cache['query_actor_id'] = torch.cat(
+                [query_actor_id, query_padding], dim=1)
+        return cache
+
+    @staticmethod
     def _prescf_role_supervision_outputs(state):
         """Expose pure current predictions and next-state roles separately."""
         prediction = dict(
@@ -1457,35 +1529,49 @@ class SparseWorld4DTraj(OPUS):
                 # carried points against actors at t (not t+1); applying the
                 # next ego transform here would supervise the wrong frame.
                 metadata = current_metadata
-                current_semantics = kwargs.get('voxel_semantics_current')
-                if interval > 0:
-                    temporal = kwargs.get('temporal_semantics')
-                    if isinstance(temporal, dict):
-                        current_semantics = temporal.get(
-                            interval, temporal.get(str(interval)))
-                    elif temporal is not None and len(temporal) >= interval:
-                        current_semantics = temporal[interval - 1]
-                    if isinstance(current_semantics, dict):
-                        current_semantics = current_semantics.get(
-                            'voxel_semantics')
-                if current_semantics is not None and hasattr(
-                        self.pts_bbox_head, 'build_role_match_cache'):
-                    role_cache = self.pts_bbox_head.build_role_match_cache(
-                        state_points, current_semantics,
-                        role_metadata=metadata)
+                # For interval > 0, the preceding transition's future cache
+                # was built from this exact carried point state, semantic GT
+                # and actor metadata.  Reuse it and append ignored slots for
+                # the newly activated t+1 Queries.  This is supervision-
+                # equivalent and removes a full repeated voxel/KNN pass per
+                # recursive step after the first.
+                previous_future_cache = (
+                    match_cache_list[-1]
+                    if interval > 0 and match_cache_list else None)
+                if previous_future_cache is not None:
+                    role_cache = self._append_unmatched_queries_to_role_cache(
+                        previous_future_cache, num_new)
+                else:
+                    current_semantics = kwargs.get(
+                        'voxel_semantics_current')
+                    if interval > 0:
+                        temporal = kwargs.get('temporal_semantics')
+                        if isinstance(temporal, dict):
+                            current_semantics = temporal.get(
+                                interval, temporal.get(str(interval)))
+                        elif (temporal is not None and
+                              len(temporal) >= interval):
+                            current_semantics = temporal[interval - 1]
+                        if isinstance(current_semantics, dict):
+                            current_semantics = current_semantics.get(
+                                'voxel_semantics')
+                    if current_semantics is not None and hasattr(
+                            self.pts_bbox_head, 'build_role_match_cache'):
+                        role_cache = \
+                            self.pts_bbox_head.build_role_match_cache(
+                                state_points, current_semantics,
+                                role_metadata=metadata)
+                    elif metadata is not None:
+                        role_target, role_target_valid = \
+                            self._role_targets_from_metadata(
+                                decode_points(state_points, self.pc_range),
+                                metadata)
+                        role_cache = dict(
+                            role_target=role_target.squeeze(-1),
+                            role_valid=role_target_valid.squeeze(-1))
+                if role_cache is not None:
                     role_cache = self._apply_actor_association_to_role_cache(
                         role_cache, state_point_actor_id, metadata)
-                    role_target = role_cache['role_target'].unsqueeze(-1)
-                    role_target_valid = role_cache['role_valid'].unsqueeze(-1)
-                elif metadata is not None:
-                    role_target, role_target_valid = self._role_targets_from_metadata(
-                        decode_points(state_points, self.pc_range), metadata)
-                    role_cache = dict(role_target=role_target.squeeze(-1),
-                                      role_valid=role_target_valid.squeeze(-1))
-                    role_cache = self._apply_actor_association_to_role_cache(
-                        role_cache, state_point_actor_id, metadata)
-                    role_target = role_cache['role_target'].unsqueeze(-1)
-                    role_target_valid = role_cache['role_valid'].unsqueeze(-1)
                 role_cache = self._mask_new_query_role_cache(
                     role_cache, num_carried)
                 if role_cache is not None:
@@ -1832,19 +1918,42 @@ class SparseWorld4DTraj(OPUS):
 
         losses = dict()
         ind_stamps_all = self.pts_bbox_head.ind_stamps_all
-        if self.pretrain:
-            loss_inputs = [voxel_semantics, temporal_semantics, temporal2ego, outs]
-            losses.update(self.pts_bbox_head.loss_pretrain(*loss_inputs))
+        compute_baseline_anchor_losses = not (
+            self.dsqe_mode == 'prescf' and
+            self.prescf_skip_frozen_baseline_losses and
+            self._prescf_tass_frozen)
+        if compute_baseline_anchor_losses:
+            if self.pretrain:
+                loss_inputs = [voxel_semantics, temporal_semantics,
+                               temporal2ego, outs]
+                losses.update(self.pts_bbox_head.loss_pretrain(*loss_inputs))
+            else:
+                # Stage 3 restores the BaseLine occupancy anchor when the
+                # configured final TASS layers become trainable.  Stages 1/2
+                # skip it because every receiving BaseLine parameter is
+                # frozen; the detector forward above is still executed and
+                # supplies the identical Query state to PreSCF.
+                loss_inputs = [voxel_semantics, temporal_semantics,
+                               temporal2ego, outs]
+                losses.update(self.pts_bbox_head.loss_pretrain(*loss_inputs))
+                outs['init_points'] = None
+                for i in range(len(outs['all_cls_scores'])):
+                    current = ind_stamps_all == 0
+                    outs['all_cls_scores'][i] = \
+                        outs['all_cls_scores'][i][:, current]
+                    outs['all_refine_pts'][i] = \
+                        outs['all_refine_pts'][i][:, current]
+                loss_inputs = [voxel_semantics, outs]
+                losses.update(self.pts_bbox_head.loss(*loss_inputs))
         else:
-            # outs_inits = dict(init_points = outs['init_points'],all_cls_scores = [], all_refine_pts = [])
-            loss_inputs = [voxel_semantics, temporal_semantics, temporal2ego, outs]
-            losses.update(self.pts_bbox_head.loss_pretrain(*loss_inputs))
-            outs['init_points'] = None
-            for i in range(len(outs['all_cls_scores'])):
-                outs['all_cls_scores'][i] = outs['all_cls_scores'][i][:,ind_stamps_all==0]
-                outs['all_refine_pts'][i] = outs['all_refine_pts'][i][:,ind_stamps_all==0]
-            loss_inputs = [voxel_semantics,outs,]
-            losses.update(self.pts_bbox_head.loss(*loss_inputs))
+            # The final TASS layers are intentionally present in the DDP
+            # reducer before Stage 3.  Preserve graph visibility for all of
+            # their returned branches after removing the frozen-only
+            # BaseLine losses, while the registered gradient gate keeps their
+            # optimizer gradients exactly zero.
+            tass_anchor = self._prescf_tass_ddp_anchor(outs)
+            if tass_anchor is not None:
+                losses['loss_prescf_tass_ddp_anchor'] = tass_anchor
 
         forecast_points_list = outputs['forecast_points_list']
         forecast_semantics_list = outputs['forecast_semantics_list']

@@ -260,6 +260,17 @@ class NuScenesDatasetOccpancy4DTraj(NuScenesDataset):
             else:
                 self.temp2nusc_map.append(idx + 5)  # fair comparison with OccWorld
 
+        # ``NuScenesDataset`` normally applies ``load_interval`` while
+        # loading ``data_infos``.  This dataset keeps the complete temporal
+        # sequence in ``data_infos`` because ``__getitem__`` and the temporal
+        # target builders index future frames by ``index + interval``.
+        # Subsampling ``data_infos`` itself would therefore break temporal
+        # adjacency.  Subsample only the list of valid current-frame anchors
+        # instead; the default interval=1 remains exactly the full dataset.
+        load_interval = max(int(getattr(self, 'load_interval', 1)), 1)
+        if load_interval > 1:
+            self.temp2nusc_map = self.temp2nusc_map[::load_interval]
+
         return data_infos
 
     def get_rays(self, index):

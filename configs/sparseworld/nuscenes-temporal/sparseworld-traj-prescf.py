@@ -69,6 +69,11 @@ model = dict(
         joint_correction_min_gate=0.1,
         freeze_backbone=True,
         freeze_baseline_heads=True,
+        # Stages 1/2 still execute the complete BaseLine forward to produce
+        # RAP/TASS Queries, but omit its frozen-only occupancy losses and
+        # duplicate KNN target construction.  Stage 3 restores those losses
+        # automatically when the configured TASS layers are unfrozen.
+        skip_frozen_baseline_losses=True,
         freeze_tass=True))
 
 evaluation = dict(
