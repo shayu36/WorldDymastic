@@ -44,9 +44,8 @@ model = dict(
         role_dynamic_weight_max=20.0,
         role_focal_gamma=2.0,
         role_match_max_distance=2.5,
-        # Unassociated points may acquire (but never replace) a persistent
-        # dynamic actor ID once future geometry enters this metric radius.
-        actor_recovery_max_distance=2.5,
+        # Actor boxes/trajectories supervise role and geometry independently
+        # at each horizon.  PreSCF deliberately carries no instance ID.
         # Bidirectional dynamic coverage uses a robust pointwise Huber loss;
         # this beta is in metric metres after Query points are decoded.
         dynamic_huber_beta=0.2,

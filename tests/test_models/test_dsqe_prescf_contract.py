@@ -397,13 +397,9 @@ def test_query_role_gt_is_fixed_and_shared_across_losses_and_metrics():
         [[[1., 0.], [0., 0.]]], requires_grad=True)
     cache = dict(
         role_target=point_target,
-        role_valid=torch.ones(1, 2, 2, dtype=torch.bool),
-        # Association is authoritative: Query 1 is dynamic even though its
-        # current point labels are both zero.
-        query_actor_id=torch.tensor([[-1, 3]]),
-        actor_valid=torch.ones(1, 2, 2, dtype=torch.bool))
+        role_valid=torch.ones(1, 2, 2, dtype=torch.bool))
     query_target, query_valid = OPUSHead._query_role_targets(cache)
-    assert torch.equal(query_target, torch.tensor([[0.5, 1.0]]))
+    assert torch.equal(query_target, torch.tensor([[0.5, 0.0]]))
     assert query_valid.all()
     assert not query_target.requires_grad and not query_valid.requires_grad
 
@@ -913,148 +909,6 @@ def test_actor_box_dimensions_preserve_vad_wlh_for_second_yaw_footprint():
         static_ids=[1, 8, 11, 12, 13, 14, 15, 16],
         dynamic_ids=[2, 3, 4, 5, 6, 7, 9, 10])
     assert torch.equal(valid, torch.tensor([False, True]))
-
-
-def _association_metadata(torch, valid=(True, True)):
-    return [dict(
-        centers=torch.tensor([[0., 0., 0.], [10., 0., 0.]]),
-        radius=torch.tensor([3., 3.]),
-        role=torch.tensor([1., 1.]),
-        valid=torch.tensor(valid),
-        labels=torch.tensor([4, 4]),
-        dims=torch.tensor([[4., 4., 2.], [4., 4., 2.]]),
-        yaw=torch.tensor([0., 0.]),
-        inflation=0.)]
-
-
-def test_carried_actor_association_is_propagated():
-    torch = pytest.importorskip('torch')
-    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
-
-    points = torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]])
-    association = SparseWorld4DTraj._initialize_actor_association(
-        points, _association_metadata(torch))
-    point_actor_id = association['point_actor_id']
-    assert point_actor_id.tolist() == [[[0, 0]]]
-    # Six arbitrarily drifted future geometries do not rewrite identity.
-    for _ in range(6):
-        drifted_points = points + torch.randn_like(points) * 100
-        del drifted_points  # geometry is intentionally irrelevant after activation
-        valid = SparseWorld4DTraj._refresh_actor_association(
-            point_actor_id, _association_metadata(torch))
-        assert point_actor_id.tolist() == [[[0, 0]]]
-        assert valid.all()
-        assert SparseWorld4DTraj._query_actor_ids(
-            point_actor_id).item() == 0
-
-
-def test_new_query_actor_association_is_initialized_independently():
-    torch = pytest.importorskip('torch')
-    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
-
-    metadata = _association_metadata(torch)
-    carried = SparseWorld4DTraj._initialize_actor_association(
-        torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]]), metadata)
-    new = SparseWorld4DTraj._initialize_actor_association(
-        torch.tensor([[[[10., 0., 0.], [11., 0., 0.]]]]), metadata)
-    combined = torch.cat(
-        [carried['point_actor_id'], new['point_actor_id']], dim=1)
-    assert combined.tolist() == [[[0, 0], [1, 1]]]
-    assert SparseWorld4DTraj._query_actor_ids(combined).tolist() == [[0, 1]]
-
-
-def test_new_query_actor_association_waits_for_future_horizon():
-    torch = pytest.importorskip('torch')
-    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
-
-    current_metadata = [dict(
-        centers=torch.tensor([[0., 0., 0.], [10., 0., 0.]]),
-        radius=torch.tensor([2., 2.]), role=torch.ones(2),
-        valid=torch.ones(2, dtype=torch.bool),
-        dims=torch.tensor([[3., 3., 2.], [3., 3., 2.]]),
-        yaw=torch.zeros(2), inflation=0.)]
-    future_metadata = [dict(
-        # Actor row 0 moves to x=10 at t+1; row 1 moves away.  Premature
-        # matching at t would bind this proposal to the wrong row 1.
-        centers=torch.tensor([[10., 0., 0.], [20., 0., 0.]]),
-        radius=torch.tensor([2., 2.]), role=torch.ones(2),
-        valid=torch.ones(2, dtype=torch.bool),
-        dims=torch.tensor([[3., 3., 2.], [3., 3., 2.]]),
-        yaw=torch.zeros(2), inflation=0.)]
-    new_points = torch.tensor([[[[10., 0., 0.], [10.5, 0., 0.]]]])
-
-    # stamp=t+1 starts unassociated and is excluded from the current cache,
-    # even though its proposal overlaps actor row 1 at time t.
-    point_actor_id = torch.full((1, 1, 2), -1, dtype=torch.long)
-    current_cache = dict(
-        role_target=torch.ones(1, 1, 2),
-        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
-    current_cache = SparseWorld4DTraj._mask_new_query_role_cache(
-        current_cache, num_carried=0)
-    assert point_actor_id.eq(-1).all()
-    assert not current_cache['role_valid'].any()
-
-    recovered = SparseWorld4DTraj._recover_actor_association(
-        point_actor_id, new_points, future_metadata, max_distance=2.5)
-    assert recovered['point_actor_id'].tolist() == [[[0, 0]]]
-    assert recovered['query_actor_id'].tolist() == [[0]]
-
-    # Demonstrate why the current-horizon match is forbidden.
-    premature = SparseWorld4DTraj._initialize_actor_association(
-        new_points, current_metadata)
-    assert premature['point_actor_id'].tolist() == [[[1, 1]]]
-
-
-def test_actor_invalidity_masks_future_role_supervision():
-    torch = pytest.importorskip('torch')
-    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
-
-    points = torch.tensor([[[[0., 0., 0.], [1., 0., 0.]]]])
-    association = SparseWorld4DTraj._initialize_actor_association(
-        points, _association_metadata(torch))
-    point_actor_id = association['point_actor_id']
-    original = dict(
-        role_target=torch.zeros(1, 1, 2),
-        role_valid=torch.ones(1, 1, 2, dtype=torch.bool))
-    future = SparseWorld4DTraj._apply_actor_association_to_role_cache(
-        original, point_actor_id, _association_metadata(torch, (False, True)))
-    assert future['point_actor_id'].tolist() == [[[0, 0]]]
-    assert future['query_actor_id'].item() == 0  # identity persists
-    assert future['role_target'].eq(1).all()
-    assert not future['role_valid'].any()  # supervision follows future validity
-    assert not future['actor_valid'].any()
-
-
-def test_recovered_actor_association_persists_without_overwrite():
-    torch = pytest.importorskip('torch')
-    from mmdet3d.models.sparsedetectors.sparseworld_4d_traj import SparseWorld4DTraj
-
-    metadata = _association_metadata(torch)
-    # A small/unobserved actor has no point in its footprint at activation.
-    activation = torch.tensor([[[[5., 5., 0.], [6., 5., 0.]]]])
-    association = SparseWorld4DTraj._initialize_actor_association(
-        activation, metadata)
-    assert association['point_actor_id'].eq(-1).all()
-
-    # Reverse dynamic coverage can move one point into actor 0's footprint.
-    recovered_geometry = torch.tensor(
-        [[[[0.5, 0., 0.], [6., 5., 0.]]]])
-    recovered = SparseWorld4DTraj._recover_actor_association(
-        association['point_actor_id'], recovered_geometry, metadata,
-        max_distance=2.5)
-    assert recovered['point_actor_id'].tolist() == [[[0, -1]]]
-    assert recovered['recovered_mask'].tolist() == [[[True, False]]]
-
-    persistent = recovered['point_actor_id']
-    # Even when the recovered point later drifts onto actor 1, its existing
-    # actor-0 identity is immutable; only still-unassociated points may fill.
-    for _ in range(6):
-        drifted = torch.tensor([[[[10., 0., 0.], [20., 20., 0.]]]])
-        next_state = SparseWorld4DTraj._recover_actor_association(
-            persistent, drifted, metadata, max_distance=2.5)
-        assert next_state['point_actor_id'][0, 0, 0].item() == 0
-        assert not next_state['recovered_mask'][0, 0, 0]
-        persistent = next_state['point_actor_id']
 
 
 def test_shared_ego_pose_is_exported_in_vad_lidar_planning_frame():

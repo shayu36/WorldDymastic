@@ -712,12 +712,10 @@ class OPUSHead(BaseModule):
     def _query_role_targets(cache):
         """Build fixed Query-level GT without learned pooling weights.
 
-        A persistent actor association is authoritative for dynamic Queries.
-        Unassociated Queries fall back to the unweighted mean of their valid
-        point labels.  Actor future invalidity masks the associated Query
-        instead of changing its identity or turning it into a static target.
-        Both outputs are detached supervision tensors shared by role loss,
-        metrics and motion-leak regularization.
+        The target is the unweighted mean of valid point labels, independent
+        of learned pooling weights and instance identity.  Both outputs are
+        detached supervision tensors shared by role loss, metrics and
+        motion-leak regularization.
         """
         target = cache['role_target'].detach()
         valid = cache['role_valid'].detach().bool()
@@ -726,21 +724,6 @@ class OPUSHead(BaseModule):
             (gt_weights * target).sum(dim=2) /
             gt_weights.sum(dim=2).clamp_min(1.0))
         query_valid = valid.any(dim=2)
-
-        query_actor_id = cache.get('query_actor_id')
-        if query_actor_id is not None:
-            query_actor_id = query_actor_id.to(target.device).detach()
-            associated = query_actor_id >= 0
-            actor_valid = cache.get('actor_valid')
-            if actor_valid is None:
-                associated_valid = associated
-            else:
-                associated_valid = actor_valid.to(
-                    target.device).detach().bool().any(dim=2)
-            query_target = torch.where(
-                associated, torch.ones_like(query_target), query_target)
-            query_valid = torch.where(
-                associated, associated_valid, query_valid)
         return query_target.detach(), query_valid.detach()
 
     def _loss_role(self, output, cache):
